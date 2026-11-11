@@ -1,0 +1,6 @@
+# bernese — optional dependencies for the full-screen TUI.
+# The CLI subcommands and the fallback curses menu need NONE of these (stdlib only).
+# Pinned to what bernese was built/tested against; Textual's API shifts between
+# majors, so keep these pins when distributing.
+textual==8.2.8
+rich==15.0.0

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bernese"
+version = "1.0.0"
+description = "Interactive BloodHound CE / RustHound-CE attack-path explorer (TUI + CLI)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["bloodhound", "active-directory", "pentest", "adcs", "kerberoast", "tui"]
+# The TUI needs textual + rich; declaring them here means `pipx install` sets them up
+# automatically in its isolated venv. (The CLI / curses menu alone need neither.)
+dependencies = [
+    "textual>=8,<9",
+    "rich>=15,<16",
+]
+
+[project.scripts]
+bernese = "bernese:main"
+
+[project.urls]
+Homepage = "https://github.com/ksmtp/bernese"
+
+[tool.setuptools]
+# single-module project — ship just bernese.py (not the dev tools/ or sample data)
+py-modules = ["bernese"]
