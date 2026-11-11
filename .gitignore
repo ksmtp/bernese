@@ -20,6 +20,8 @@ shots/
 *.json
 labdata-corp/
 labdata-laps1000/
+labdata-lateral/
+labdata-forest/
 
 # OS cruft
 .DS_Store
