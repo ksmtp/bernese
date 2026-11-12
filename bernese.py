@@ -5510,9 +5510,12 @@ class AttackTreeBase(Vertical):
         for r in sorted(by_right, key=lambda r: -len(by_right[r])):
             tgts = list(dict.fromkeys(by_right[r]))
             if len(tgts) > 15:
-                kind = g.nodes[tgts[0]].kind if g.nodes.get(tgts[0]) else "object"
+                kinds = defaultdict(int)
+                for x in tgts:
+                    kinds[g.nodes[x].kind.lower() if g.nodes.get(x) else "object"] += 1
                 lab = Text(f"{r} -> ", style="bold magenta" if r in bh._DANGER else "yellow")
-                lab.append(f"{len(tgts)} {kind.lower()}s", style="bold")
+                lab.append(" + ".join(f"{c} {k}s" for k, c in
+                                      sorted(kinds.items(), key=lambda kv: -kv[1])), style="bold")
                 juicy = sum(1 for x in tgts if g.nodes.get(x) and g.nodes[x].kind == "Computer"
                             and bh._computer_value(g, x, self.app.priv)[0])
                 if juicy:
@@ -5852,22 +5855,37 @@ class ExploreView(AttackTreeBase):
         tree.root.data = None
         tree.root.set_label(banner(f"{OWNED} OWNED SET ({len(owned)}) — your footholds "
                                    "(Ctrl+S pivots)", bg="dark_green"))
+        few = len(owned) <= 5                      # auto-open group rights only for a few
         for s in sorted(owned, key=self._list_sort_key):
-            child = tree.root.add(self._line(s), data={"sid": s, "anc": frozenset({s})})
-            # pre-attach this foothold's shortest route to high-value and auto-expand it,
-            # so an owned principal's path is always visible (not hidden behind a pivot).
+            anc = frozenset({s})
+            child = tree.root.add(self._line(s), data={"sid": s, "anc": anc})
+            # pre-attach this foothold's shortest route to high-value, then — like the
+            # start node — everything it is in and can take over, so a group's OTHER
+            # rights (not just the one hop on the shortest path) show here too.
             tgt = None
             if not g.is_highvalue(s):
                 reach = g.reachable(s)
                 hvs = [h for h in reach if h != s and g.is_highvalue(h)]
                 tgt = min(hvs, key=lambda h: reach[h][0]) if hvs else None
             if tgt is not None:
-                child.data["loaded"] = True          # path is the content; don't re-populate
                 self._add_path_hops(child, s, tgt)
+            n_before = len(child.children)
+            if self._expandable(s, anc):
+                kind = g.nodes[s].kind.lower()
+                self._section(child, f"DIRECT — what this {'user' if kind == 'user' else kind} "
+                                     "is in and can take over")
+                self._add_attack_children(child, s, anc)
+            if len(child.children) > n_before or tgt is not None:
+                child.data["loaded"] = True          # content attached; don't re-populate
                 child.allow_expand = True
                 child.expand()
+                if few:
+                    for c in child.children[n_before:]:
+                        if (c.data or {}).get("sid") and c.allow_expand:
+                            self._populate(c)
+                            c.expand()
             else:
-                child.allow_expand = self._expandable(s, frozenset({s}))
+                child.allow_expand = False
                 child.data["owned_leaf"] = True      # selecting it inspects, never pivots
         tree.root.expand()
 
