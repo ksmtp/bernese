@@ -4313,6 +4313,7 @@ KIND_COLOR = {"User": "green", "Group": "yellow", "Computer": "cyan",
 
 INLINE_CAP = 12                       # rows shown when a fan-out / category is dropped down
 OWNED = "\U0001f480"                   # 💀 — owned marker, like BloodHound's skull
+TABLE_CAP = 10000                         # rows drawn in a searchable list (search narrows)
 OWNED_TAG = f"{OWNED} owned"           # icon + word — shown on every owned principal
 STAR = "◆"                        # ◆ — high-value (one diamond glyph for all high-priv)
 CHECK = "✓"                       # ✓ — right you already hold
@@ -5221,10 +5222,10 @@ class PrincipalTable(Vertical):
 
     def _name_cell(self, s):
         t = Text()
-        if s in self.app.owned:
-            t.append(f"{OWNED_TAG}  ", style=OWNED_STYLE)
         # no "(User)" suffix here — the table already has a KIND column
         t.append_text(ntext(self.g, s, star=False, priv=self.app.priv, kind=False))
+        if s in self.app.owned:
+            t.append(f"  {OWNED_TAG}", style=OWNED_STYLE)
         return t
 
     def _ctrl_cell(self, s):
@@ -5247,7 +5248,7 @@ class PrincipalTable(Vertical):
         else:
             col = self._col_names[self.sort_col]
             rows.sort(key=lambda s: self._col_key(s, col), reverse=self.sort_desc)
-        self._rows = rows[:2000]
+        self._rows = rows[:TABLE_CAP]
         for s in self._rows:
             gn = bh._group_names(g, s, limit=2)              # keep the GROUPS column narrow
             grps = ", ".join(gn)
@@ -5271,7 +5272,9 @@ class PrincipalTable(Vertical):
             srt = self._col_names[self.sort_col] + (" ▼" if self.sort_desc else " ▲")
         filt = "  ·  enabled only" if self.hide_disabled else ""
         scol = f"  ·  search: {self.search_col}" if self.search_col != "NAME" else ""
-        t.border_title = f"{self.title}  ·  {len(rows)} shown  ·  sort: {srt}{scol}{filt}"
+        shown = (f"{len(self._rows)} of {len(rows)} shown (type to narrow)"
+                 if len(rows) > len(self._rows) else f"{len(rows)} shown")
+        t.border_title = f"{self.title}  ·  {shown}  ·  sort: {srt}{scol}{filt}"
         try:                                              # show which column the search hits
             self.query_one("#filter", Input).placeholder = f"search {self.search_col}…"
         except Exception:
@@ -5441,9 +5444,9 @@ class AttackTreeBase(Vertical):
             t.append(f"{edge} -> ", style=style)
         elif edge == "MemberOf":
             t.append("in ", style="grey50")
-        if sid in self.app.owned:
-            t.append(f"{OWNED_TAG}  ", style=OWNED_STYLE)
         t.append_text(ntext(g, sid, priv=self.app.priv))
+        if sid in self.app.owned:
+            t.append(f"  {OWNED_TAG}", style=OWNED_STYLE)
         n = g.nodes.get(sid)
         if n and n.kind == "Computer" and bh._computer_value(g, sid, self.app.priv)[0]:
             t.append("  key target", style="bold red")
@@ -5509,25 +5512,35 @@ class AttackTreeBase(Vertical):
         g = self.g
         for r in sorted(by_right, key=lambda r: -len(by_right[r])):
             tgts = list(dict.fromkeys(by_right[r]))
-            if len(tgts) > 15:
-                kinds = defaultdict(int)
-                for x in tgts:
-                    kinds[g.nodes[x].kind.lower() if g.nodes.get(x) else "object"] += 1
+            if len(tgts) <= 15:
+                self._add_target_nodes(node, r, tgts, anc)
+                continue
+            # a big fan-out: one drop-down PER KIND (users / computers / groups …), so each
+            # opens its own full list; a small kind slice is just listed inline
+            by_kind = defaultdict(list)
+            for x in tgts:
+                by_kind[g.nodes[x].kind if g.nodes.get(x) else "Object"].append(x)
+            for kind in sorted(by_kind, key=lambda k: -len(by_kind[k])):
+                ks = by_kind[kind]
+                if len(ks) <= 15:
+                    self._add_target_nodes(node, r, ks, anc)
+                    continue
                 lab = Text(f"{r} -> ", style="bold magenta" if r in bh._DANGER else "yellow")
-                lab.append(" + ".join(f"{c} {k}s" for k, c in
-                                      sorted(kinds.items(), key=lambda kv: -kv[1])), style="bold")
-                juicy = sum(1 for x in tgts if g.nodes.get(x) and g.nodes[x].kind == "Computer"
+                lab.append(f"{len(ks)} {kind.lower()}s", style="bold")
+                juicy = sum(1 for x in ks if g.nodes.get(x) and g.nodes[x].kind == "Computer"
                             and bh._computer_value(g, x, self.app.priv)[0])
                 if juicy:
                     lab.append(f"   {juicy} key targets", style="bold red")
                 lab.append("   (Space/Enter drops down)", style="grey50")
-                leaf = node.add(lab, data={"listexpand": (f"{r} targets", tgts)})
+                leaf = node.add(lab, data={"listexpand": (f"{r} -> {kind.lower()}s", ks)})
                 leaf.allow_expand = True
-            else:
-                for d in sorted(tgts, key=lambda s: short(g, s).lower()):
-                    child = node.add(self._line(d, r), data={"sid": d, "anc": anc | {d}})
-                    child.allow_expand = self._expandable(d, anc | {d})
         return len(by_right)
+
+    def _add_target_nodes(self, node, r, tgts, anc):
+        g = self.g
+        for d in sorted(tgts, key=lambda s: short(g, s).lower()):
+            child = node.add(self._line(d, r), data={"sid": d, "anc": anc | {d}})
+            child.allow_expand = self._expandable(d, anc | {d})
 
     def _rights_map(self, sid, anc, skip=None):
         """{right-label: [target sids]} for the non-MemberOf control edges sid holds."""
@@ -6400,7 +6413,7 @@ class MaqView(Vertical):
         return self.app.g
 
     def _owned(self, sid):
-        return f"{OWNED_TAG}  " if sid in self.app.owned else ""
+        return f"  {OWNED_TAG}" if sid in self.app.owned else ""
 
     def on_mount(self):
         g = self.g
@@ -6429,8 +6442,8 @@ class MaqView(Vertical):
             cat.add_leaf(Text("none — no user-owned computer objects in this collection", style="grey50"))
         for owner in sorted(by, key=lambda s: (-len(by[s]), short(g, s).lower())):
             comps = list(dict.fromkeys(by[owner]))
-            lab = Text(self._owned(owner), style="bold green")
-            lab.append_text(ntext(g, owner, priv=self.app.priv))
+            lab = ntext(g, owner, priv=self.app.priv)
+            lab.append(self._owned(owner), style="bold green")
             lab.append(f"   owns {len(comps)}", style="cyan")
             onode = cat.add(lab, data={"sid": owner, "comps": comps})
             onode.allow_expand = True
@@ -6440,8 +6453,8 @@ class MaqView(Vertical):
         tree.focus()
 
     def _cline(self, sid):
-        g, t = self.g, Text(self._owned(sid), style="bold green")
-        t.append_text(ntext(g, sid, priv=self.app.priv))
+        g, t = self.g, ntext(self.g, sid, priv=self.app.priv)
+        t.append(self._owned(sid), style="bold green")
         n = g.nodes.get(sid)
         if n and n.kind == "Computer" and bh._computer_value(g, sid, self.app.priv)[0]:
             t.append("  key target", style="bold red")
