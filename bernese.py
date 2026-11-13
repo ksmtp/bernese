@@ -38,7 +38,7 @@ import sys
 import zipfile
 from collections import defaultdict, deque
 
-__version__ = "1.1"
+__version__ = "1.2"
 
 # --------------------------------------------------------------------------- #
 # Colour
@@ -408,6 +408,45 @@ class Graph:
                 if nxt not in seen:
                     seen[nxt] = (d + 1, lbl)
                     q.append(nxt)
+        return seen
+
+    def reach_from(self, sources):
+        """One BFS from a SET of sources at once. Returns {sid: (dist, origin, parent, lbl)}:
+        hops from the nearest source, which source that is, and the back-pointer."""
+        seen = {s: (0, s, None, None) for s in sources}
+        q = deque(seen)
+        while q:
+            cur = q.popleft()
+            d, origin = seen[cur][0], seen[cur][1]
+            for (nxt, lbl) in self.ctrl.get(cur, []):
+                if nxt not in seen:
+                    seen[nxt] = (d + 1, origin, cur, lbl)
+                    q.append(nxt)
+        return seen
+
+    @staticmethod
+    def path_in(reach, dst):
+        """The [(sid, lbl)] chain origin -> dst out of a `reach_from` result (or None)."""
+        if dst not in reach:
+            return None
+        path, cur = [], dst
+        while cur is not None:
+            _d, _o, parent, lbl = reach[cur]
+            path.append((cur, lbl))
+            cur = parent
+        path.reverse()
+        return path
+
+    def reached_by(self, dst):
+        """Reverse BFS: {sid: hops to dst} for every principal that can reach dst."""
+        seen = {dst: 0}
+        q = deque([dst])
+        while q:
+            cur = q.popleft()
+            for (src, _lbl) in self.rctrl.get(cur, []):
+                if src not in seen:
+                    seen[src] = seen[cur] + 1
+                    q.append(src)
         return seen
 
 # --------------------------------------------------------------------------- #
@@ -4324,6 +4363,10 @@ PRIV_STYLE = "bold orange1"           # privileged USERS — orange, never green
 PRIV_COMP_STYLE = "bold magenta"      # privileged / high-value COMPUTERS — distinct from users
 ROAST_ADMIN_STYLE = "bold red"        # kerberoastable privileged accounts — crack = instant admin
 OWNED_STYLE = "bold green"            # the owned icon + word
+TARGET = "\U0001f3af"                  # 🎯 — a node you are going after (^t)
+TARGET_STYLE = "bold yellow"
+TARGET_KINDS = ("User", "Computer", "Group", "GPO", "OU", "Domain", "Container",
+                "CertTemplate", "EnterpriseCA")
 
 
 def is_kerberoastable(g, sid):
@@ -4925,37 +4968,12 @@ def start_power(g, sid):
 
 
 def dashboard_position_rows(g, app):
-    """Clickable position rows for the overview: START (+ its shortest path), OWNED, and
-    the single FASTEST WIN. Each is (dispatch_id, rich-Text label, enabled)."""
+    """Clickable position rows for the overview: OWNED footholds, your TARGETS (with whether
+    the owned set reaches each), and the single FASTEST WIN. Each is (id, Text, enabled)."""
     priv = app.priv
     rows = []
     pad = "  "                                  # small indent for the sub-rows (kept left so
     #                                             a "NAME: Right ×N" line fits without wrapping)
-    # START — the node, then on its own indented lines: its route to DA (or lack of one)
-    # and the single strongest ACL right it wields.
-    if app.start:
-        lab = Text(f"{'START':<8}", style="bold grey62")
-        lab.append_text(ntext(g, app.start, priv=priv))
-        rows.append(("start_tree", lab, True))
-        if g.is_highvalue(app.start):
-            rows.append(("start_tree", Text(f"{pad}this node IS high-value", style="bold red"), True))
-        else:
-            # one compact line, same shape as the OWNED rows: "NAME: TECH ⇒ target (Nh)",
-            # or the strongest right it holds when there is no route to high-value
-            rtxt = route_text(g, app.start)
-            pw = start_power(g, app.start)
-            if rtxt:
-                rows.append(("start_path", Text(f"{pad}{rtxt}", style="red"), True))
-            elif pw:
-                right, cnt, _effect = pw
-                rows.append(("start_info", Text(f"{pad}{short(g, app.start)}: {right} ×{cnt}",
-                                                style="red"), True))
-            else:
-                rows.append(("start_tree",
-                             Text(f"{pad}no route to a high-value target", style="grey50"), False))
-    else:
-        rows.append(("start_tree", Text(f"{'START':<8}none — pick a node from Users / Computers",
-                                        style="bold grey62"), True))
     # OWNED — count + the footholds you hold, each with the strongest right IT wields (so an
     # owned foothold's privesc shows here even when it is not the current start node).
     if app.owned:
@@ -4965,8 +4983,6 @@ def dashboard_position_rows(g, app):
         lab.append(", ".join(names[:4]) + ("  …" if len(names) > 4 else ""), style="green")
         rows.append(("owned_view", lab, True))
         for s in sorted(app.owned, key=lambda s: short(g, s).lower()):
-            if s == app.start:
-                continue                          # the start's right is already shown above
             pw = start_power(g, s)
             if pw:
                 right, cnt, _effect = pw
@@ -4974,6 +4990,19 @@ def dashboard_position_rows(g, app):
     else:
         rows.append(("owned_view", Text(f"{'OWNED':<8}none — highlight a node and press Ctrl+O",
                                         style="bold grey62"), False))
+    # TARGETS — one line per 🎯: reachable from the owned set (hops + foothold) or not
+    if app.targets:
+        reach = app.owned_reach()
+        for i, s in enumerate(sorted(app.targets, key=lambda s: short(g, s).lower())):
+            lab = Text(f"{'TARGETS' if i == 0 else '':<8}", style="bold grey62")
+            lab.append(f"{TARGET} {short(g, s)}  ", style=TARGET_STYLE)
+            if s in app.owned:
+                lab.append(f"{OWNED} owned", style=OWNED_STYLE)
+            elif s in reach:
+                lab.append(f"{CHECK} {reach[s][0]}h via {short(g, reach[s][1])}", style="bold green")
+            else:
+                lab.append("✗ no path", style="red")
+            rows.append((f"tgt_{s}", lab, True))
     rows.append(("_spacer", Text(""), False))         # one blank line under the OWNED block
     # FASTEST WIN — the single quickest route to domain admin
     win, target = _fastest_win(g, app)
@@ -5102,7 +5131,7 @@ class PrincipalTable(Vertical):
         self.hide_disabled = not self.hide_disabled
         self.rebuild()
 
-    def __init__(self, g, sids, title, prof_cache, show_kind=True, escalation=False):
+    def __init__(self, g, sids, title, prof_cache, show_kind=True, escalation=False, reach=False):
         super().__init__()
         self.g = g
         self.all_sids = list(sids)
@@ -5110,6 +5139,7 @@ class PrincipalTable(Vertical):
         self.prof = prof_cache
         self.show_kind = show_kind
         self.escalation = escalation        # add an ESCALATION column (route to high-value)
+        self.reach = reach                  # add a REACH column (path from the owned set)
         self.sort_col = None           # None = interest default; otherwise a column index
         self.sort_active = False        # a column can be SELECTED (highlighted) without sorting yet
         self.sort_desc = False
@@ -5129,9 +5159,13 @@ class PrincipalTable(Vertical):
     def _help_bar(self):
         t = Text()
         t.append("keys  ", style="grey50")
-        for key, what in (("click a column header", "sort + search that column"),
-                          ("^s", "set start"), ("^o", "own"),
-                          ("^e", "enabled-only"), ("^x", "export")):
+        keys = [("click a column header", "sort + search that column")]
+        if self.reach:
+            keys += [("Enter", "node info + path"), ("^t", "target"), ("^o", "own")]
+        else:
+            keys += [("^s", "set start"), ("^o", "own"), ("^t", "target")]
+        keys += [("^e", "enabled-only"), ("^x", "export")]
+        for key, what in keys:
             t.append(f" {key} ", style="bold black on grey58")
             t.append(f" {what}   ", style="grey70")
         return t
@@ -5139,6 +5173,7 @@ class PrincipalTable(Vertical):
     def on_mount(self):
         t = self.query_one("#tbl", DataTable)
         self._col_names = (["NAME"] + (["KIND"] if self.show_kind else [])
+                           + (["REACH"] if self.reach else [])
                            + (["ESCALATION"] if self.escalation else [])
                            + ["GROUPS", "CTRL", "DESC", "TAGS"])
         self._col_keys = list(t.add_columns(*self._col_names))
@@ -5168,6 +5203,17 @@ class PrincipalTable(Vertical):
             return f"→ {best[0]} ({best[1]} hop{'s' if best[1] != 1 else ''})", True
         return "no ACL path", False
 
+    def _reach_info(self, s):
+        """(sort key, cell Text) for the REACH column: owned / ✓ hops · via / no path."""
+        if s in self.app.owned:
+            return -1, Text(f"{OWNED} owned", style=OWNED_STYLE)
+        r = self.app.owned_reach().get(s)
+        if r:
+            return r[0], Text(f"{CHECK} {r[0]}h · {short(self.g, r[1])}", style="bold green")
+        if not self.app.owned:
+            return 999, Text("- (own something: ^o)", style="grey42")
+        return 999, Text("-", style="grey42")
+
     def _ctrl_count(self, s):
         return sum(1 for (_d, l) in self.g.ctrl.get(s, []) if l != "MemberOf")
 
@@ -5178,6 +5224,8 @@ class PrincipalTable(Vertical):
 
     def _interest_key(self, s):
         g, nm = self.g, short(self.g, s).lower()
+        if self.reach:                          # targets list: marked targets, then reachable
+            return (s not in self.app.targets, self._reach_info(s)[0], nm)
         spn = bool(g.nodes[s].p("hasspn") or g.nodes[s].p("serviceprincipalnames")) if s in g.nodes else False
         return (not bh._is_admin(g, s), not bool(g.is_highvalue(s)),
                 not spn, -self._ctrl_count(s), nm)                 # interest (all cheap)
@@ -5186,6 +5234,8 @@ class PrincipalTable(Vertical):
         g, n = self.g, self.g.nodes.get(s)
         if col == "KIND":
             return (n.kind if n else "?").lower()
+        if col == "REACH":
+            return self._reach_info(s)[0]
         if col == "ESCALATION":
             _s, _h, best = bh._user_profile(g, s)
             return best[1] if best else 999            # fewest hops first
@@ -5205,6 +5255,8 @@ class PrincipalTable(Vertical):
         g = self.g
         if col == "KIND":
             return (g.nodes[s].kind if s in g.nodes else "?").lower()
+        if col == "REACH":
+            return self._reach_info(s)[1].plain.lower()
         if col == "ESCALATION":
             return self._escalation(s)[0].lower()
         if col == "GROUPS":
@@ -5226,6 +5278,8 @@ class PrincipalTable(Vertical):
         t.append_text(ntext(self.g, s, star=False, priv=self.app.priv, kind=False))
         if s in self.app.owned:
             t.append(f"  {OWNED_TAG}", style=OWNED_STYLE)
+        if s in self.app.targets:
+            t.append(f"  {TARGET}", style=TARGET_STYLE)
         return t
 
     def _ctrl_cell(self, s):
@@ -5258,6 +5312,8 @@ class PrincipalTable(Vertical):
             if self.show_kind:
                 kind = g.nodes[s].kind if s in g.nodes else "?"
                 cells.append(Text(kind, style=KIND_COLOR.get(kind, "white")))
+            if self.reach:
+                cells.append(self._reach_info(s)[1])
             if self.escalation:
                 route, reaches = self._escalation(s)
                 cells.append(Text(route, style="bold red" if reaches else "grey50"))
@@ -5336,7 +5392,10 @@ class PrincipalTable(Vertical):
     def on_input_submitted(self, event: Input.Submitted):
         sid = self._current_sid()
         if sid:
-            self.app.open_start(sid)
+            if self.reach:
+                self.app.show_node_info(sid)      # targets list: Enter = is there a path?
+            else:
+                self.app.open_start(sid)
 
     def _export_sids(self):
         """The full filtered + sorted list (no display cap) for export."""
@@ -5400,10 +5459,16 @@ class PrincipalTable(Vertical):
             self._update_detail(sid)
 
     def mark_owned(self):
+        self._toggle_in(self.app.owned)
+
+    def mark_target(self):
+        self._toggle_in(self.app.targets)
+
+    def _toggle_in(self, bucket):
         sid = self._current_sid()
         if not sid:
             return
-        self.app.owned.discard(sid) if sid in self.app.owned else self.app.owned.add(sid)
+        bucket.discard(sid) if sid in bucket else bucket.add(sid)
         cur = (self.query_one("#tbl", DataTable).cursor_row) or 0
         self.rebuild()
         self.query_one("#tbl", DataTable).move_cursor(row=cur)
@@ -5447,6 +5512,8 @@ class AttackTreeBase(Vertical):
         t.append_text(ntext(g, sid, priv=self.app.priv))
         if sid in self.app.owned:
             t.append(f"  {OWNED_TAG}", style=OWNED_STYLE)
+        if sid in self.app.targets:
+            t.append(f"  {TARGET}", style=TARGET_STYLE)
         n = g.nodes.get(sid)
         if n and n.kind == "Computer" and bh._computer_value(g, sid, self.app.priv)[0]:
             t.append("  key target", style="bold red")
@@ -5648,13 +5715,13 @@ class AttackTreeBase(Vertical):
         hdr.allow_expand = True
         self._add_path_hops(hdr, sid, target)          # one nested chain, auto-expanded
 
-    def _add_path_hops(self, parent, src, dst):
+    def _add_path_hops(self, parent, src, dst, path=None):
         """Add the shortest control path src -> dst as a NESTED chain under `parent`: each
         hop is a child of the hop before it, so the route reads as one path flowing into
         itself rather than a flat broken-up list. The whole chain is auto-expanded; a hop
         opens its own node info (Enter) to branch off."""
         g, priv = self.g, self.app.priv
-        path = g.bfs_path(src, dst)
+        path = path or g.bfs_path(src, dst)
         if not path or len(path) < 2:
             return
         seen = frozenset(p[0] for p in path)
@@ -5797,6 +5864,9 @@ class ExploreView(AttackTreeBase):
             other = Tree("", id="othertree")
             other.show_root = True
             yield other
+            tgts = Tree("", id="targettree")       # your marked targets — its own tree
+            tgts.show_root = True
+            yield tgts
 
     def _ctx_label(self):
         return short(self.g, self.current) if self.current else "list"
@@ -5816,10 +5886,12 @@ class ExploreView(AttackTreeBase):
         other = self.query_one("#othertree", Tree)
         other.clear(); other.root.set_label(Text("")); other.root.data = None
         other.display = False                    # no stray empty ▶ under "no start"
+        self._fill_target_tree()                 # targets show even before a start is picked
         self.app.set_detail(intro=Text(
-            "Pick a start node (Users / Computers in the menu), then its attack paths appear "
-            "here.\n\nSpace/Enter drops a node down; a machine or holder drills into its own "
-            "tree. Mark nodes you control with Ctrl+O.", style="grey62"))
+            "Mark the principals you control with Ctrl+O, and the objects you are going after "
+            "with Ctrl+T.\n\nThen open Targets (menu, or press t) to see whether your owned "
+            "set can reach each one and how. Pick any node as a start (Users / Computers) to "
+            "walk its full attack tree.", style="grey62"))
 
     def _fill_other_tree(self):
         """Fill the SEPARATE lower tree with the domain-wide routes to DA that need NO ACL
@@ -5851,6 +5923,63 @@ class ExploreView(AttackTreeBase):
         self._category(other.root, "DCSync-capable (non-default)", sorted(dcsync), style="bold red", expand=True)
         self._category(other.root, "ADCS ESC abusers → domain", esc_abusers, style="bold red", expand=True)
         other.root.expand()
+
+    def _fill_target_tree(self):
+        """Fill the SEPARATE target tree with each marked target and its shortest path from
+        the owned set (or, with no path, the nearest principals that CAN reach it). Its own
+        tree — like OTHER ROUTES — so targets read as a distinct section. Hidden when there
+        are no targets."""
+        g, app = self.g, self.app
+        tree = self.query_one("#targettree", Tree)
+        tree.clear()
+        tgts = [s for s in app.targets if g.nodes.get(s)]
+        if not tgts:
+            tree.display = False
+            return
+        tree.display = True
+        tree.root.data = None
+        tree.root.set_label(banner(f"{TARGET} TARGETS — reachable from your owned set?",
+                                   bg="dark_goldenrod"))
+        reach = app.owned_reach()
+        for s in sorted(tgts, key=self._list_sort_key):
+            child = tree.root.add(self._line(s), data={"sid": s, "anc": frozenset({s}),
+                                                       "loaded": True})
+            if s in app.owned:
+                child.add_leaf(Text(f"{OWNED} you already own this",
+                                    style=OWNED_STYLE)).allow_expand = False
+            elif not app.owned:
+                child.add_leaf(Text("mark footholds with Ctrl+O to check reachability",
+                                    style="grey50")).allow_expand = False
+            else:
+                path = g.path_in(reach, s)
+                if path and len(path) > 1:
+                    child.add_leaf(Text(f"{CHECK} {len(path) - 1} step"
+                                        f"{'s' if len(path) != 2 else ''} from "
+                                        f"{OWNED} {short(g, path[0][0])}",
+                                        style="bold green")).allow_expand = False
+                    self._add_path_hops(child, path[0][0], s, path=path)
+                else:
+                    child.add_leaf(Text("✗ no path from your owned principals",
+                                        style="bold red")).allow_expand = False
+                    back = g.reached_by(s)
+                    near = sorted((x for x in back if x != s and g.nodes.get(x)),
+                                  key=lambda x: (back[x], short(g, x).lower()))
+                    if near:
+                        hdr = child.add(Text(f"nearest principals that reach it ({len(near)}) "
+                                             "— compromise one of these", style="grey70"))
+                        for x in near[:INLINE_CAP]:
+                            line = self._line(x)
+                            line.append(f"   {back[x]}h to target", style="grey50")
+                            hdr.add(line, data={"sid": x, "anc": frozenset({x})}).allow_expand = False
+                        if len(near) > INLINE_CAP:
+                            hdr.add(Text(f"... +{len(near) - INLINE_CAP} more (open list)",
+                                         style="grey50"),
+                                    data={"list": (f"Who can reach {short(g, s)}", near)}).allow_expand = False
+                        hdr.allow_expand = True
+                        hdr.expand()
+            child.allow_expand = True
+            child.expand()
+        tree.root.expand()
 
     def _fill_owned_tree(self):
         """Fill the SEPARATE owned tree with your other footholds (every owned principal
@@ -5939,6 +6068,7 @@ class ExploreView(AttackTreeBase):
         # your other footholds + the domain-wide out-of-band wins — each its OWN tree below
         self._fill_owned_tree()
         self._fill_other_tree()
+        self._fill_target_tree()
         tree.root.expand()
         kids = [c for c in tree.root.children if (c.data or {}).get("sid")]
         if len(kids) <= 20:
@@ -6604,11 +6734,54 @@ class NodeInfoView(AttackTreeBase):
             facts.add_leaf(Text(f"controlled by {len(inbound)} principal(s)",
                                 style="grey70")).allow_expand = False
 
+    def _add_owned_path(self, root, sid):
+        """'Path from owned': the shortest chain from the nearest owned principal to this
+        node — or, when there is none, the nearest principals that CAN reach it."""
+        g, app = self.g, self.app
+        if sid in app.owned:
+            root.add_leaf(Text(f"{OWNED} you own this", style=OWNED_STYLE)).allow_expand = False
+            return
+        if not app.owned:
+            root.add_leaf(Text("Path from owned: mark footholds with ^o to check reachability",
+                               style="grey50")).allow_expand = False
+            return
+        reach = app.owned_reach()
+        path = g.path_in(reach, sid)
+        if path and len(path) > 1:
+            hdr = root.add(Text(f"{CHECK} Path from owned: {OWNED} {short(g, path[0][0])} → "
+                                f"{len(path) - 1} step{'s' if len(path) != 2 else ''}",
+                                style="bold green"), expand=True)
+            hdr.allow_expand = True
+            hdr.data = {"sid": path[0][0], "anc": frozenset({path[0][0]}), "loaded": True}
+            self._add_path_hops(hdr, path[0][0], sid, path=path)
+            return
+        back = g.reached_by(sid)
+        near = sorted((s for s in back if s != sid and g.nodes.get(s)),
+                      key=lambda s: (back[s], short(g, s).lower()))
+        hdr = root.add(Text("✗ No path from your owned principals", style="bold red"), expand=True)
+        if not near:
+            hdr.add_leaf(Text("nothing in the collected graph controls this node",
+                              style="grey50")).allow_expand = False
+            return
+        hdr.add_leaf(Text(f"{len(near)} principal(s) can reach it — compromise one of these "
+                          f"(nearest first):", style="grey70")).allow_expand = False
+        for s in near[:INLINE_CAP]:
+            line = self._line(s)
+            line.append(f"   {back[s]}h to target", style="grey50")
+            hdr.add(line, data={"sid": s, "anc": frozenset({s})}).allow_expand = False
+        if len(near) > INLINE_CAP:
+            hdr.add(Text(f"... +{len(near) - INLINE_CAP} more (open list)", style="grey50"),
+                    data={"list": (f"Who can reach {short(g, sid)}", near)}).allow_expand = False
+
     def _on_sid_select(self, sid):
         self.app.show_node_info(sid)                  # drill in place, within the box
 
     def on_tree_node_selected(self, event: Tree.NodeSelected):
         data = event.node.data or {}
+        if "list" in data:
+            title, sids = data["list"]
+            self.app.show_list(f"{self._ctx_label()} — {title}", sids)
+            return
         if event.node.allow_expand:
             return                                   # let Enter/Space toggle; populate on expand
         if data.get("sid"):
@@ -6640,6 +6813,7 @@ class NodeInfoView(AttackTreeBase):
         tree.border_title = f"node info: {short(g, sid)}  —  Enter/Space drill · i info on selected · Esc back"
         tree.root.set_label(self._line(sid))
         tree.root.data = {"sid": sid, "anc": frozenset({sid}), "loaded": True}
+        self._add_owned_path(tree.root, sid)
         self._add_facts(tree.root, sid)
         self._add_shortest_path(tree.root, sid)
         # rights the node itself holds directly (not via a group)
@@ -6767,6 +6941,8 @@ class HomeScreen(Screen):
         Binding("i", "info", "Node info"),
         Binding("ctrl+s", "set_start", "Set as start"),
         Binding("ctrl+o", "owned", "Mark owned"),
+        Binding("ctrl+t", "target", "Mark target"),
+        Binding("t", "goto('targets')", "Targets"),
         Binding("u", "goto('users')", "Users"),
         Binding("c", "goto('computers')", "Computers"),
         Binding("g", "goto('groups')", "Groups"),
@@ -6793,9 +6969,10 @@ class HomeScreen(Screen):
 
     # (id, label).  COUNTABLE items grey out + read "none" at 0 instances.
     MENU = [
-        ("users", "Users (browse / set start)"),
-        ("computers", "Computers (browse / set start)"),
-        ("groups", "Groups (browse / read into)"),
+        ("targets", "Targets (can I reach it?)"),
+        ("users", "Users"),
+        ("computers", "Computers"),
+        ("groups", "Groups"),
         ("tree", "Attack tree"),
         ("esc", "Escalation routes"),
         ("das", "Domain admins & high-value"),
@@ -7049,6 +7226,22 @@ class HomeScreen(Screen):
             self._view.load(sid)
         self._refresh()
 
+    def action_target(self):
+        """Ctrl+T toggles the highlighted node as a target (🎯) — listed in the overview
+        with whether the owned set reaches it."""
+        if isinstance(self._aux, PrincipalTable):
+            self._aux.mark_target()
+        else:
+            sid = self._active_sid()
+            if not sid:
+                return
+            self.app.targets.symmetric_difference_update({sid})
+            if isinstance(self._aux, NodeInfoView):
+                self._aux.query_one("#tree", Tree).root.set_label(self._aux._line(self._aux.sid))
+        if self._tree_live():                    # keep the TARGETS tree in the attack view current
+            self._view._fill_target_tree()
+        self._refresh()
+
     def action_root_back(self):
         if self._tree_live():
             self._view.root_back()
@@ -7071,6 +7264,10 @@ class HomeScreen(Screen):
             if self.app.start:
                 self.show_node_info(self.app.start)
             return
+        if mid.startswith("tgt_"):          # an overview TARGETS row → its node info + path
+            if mid[4:] in g.nodes:
+                self.show_node_info(mid[4:])
+            return
         if mid in g.nodes:                  # an overview row keyed by a sid (e.g. an owned
             self.open_start(mid)            # foothold's privesc row) → open that node's tree
             return
@@ -7082,6 +7279,11 @@ class HomeScreen(Screen):
                 self.open_start(tgt)
             else:
                 self.dispatch("users")
+        elif mid == "targets":
+            sids = [s for s, n in g.nodes.items() if n.kind in TARGET_KINDS]
+            self._go(lambda: self._mount_aux(PrincipalTable(
+                g, sids, "Targets — can my owned set reach it?", self.app.prof,
+                show_kind=True, reach=True)))
         elif mid == "groups":
             sids = [s for s, n in g.nodes.items() if n.kind == "Group"]
             self._go(lambda: self._build_list("Groups — read into a member", sids))
@@ -7193,7 +7395,17 @@ class BerneseApp(App):
         self.power = {}                     # has_power memo (dead-end membership pruning)
         self.owned = set()                  # sids the operator has marked as owned
         self.start = None                   # current start node (its tree is shown on Home)
+        self.targets = set()                # sids marked as targets (^t)
+        self._reach = (None, {})            # (frozenset(owned), reach_from result) cache
         self.sub_title = (g.domain_name or "?")
+
+    def owned_reach(self):
+        """{sid: (dist, origin, parent, lbl)} for everything the owned set can reach —
+        recomputed only when the owned set changes."""
+        key = frozenset(self.owned)
+        if self._reach[0] != key:
+            self._reach = (key, self.g.reach_from(key) if key else {})
+        return self._reach[1]
 
     def on_mount(self):
         self.push_screen(HomeScreen(self.g))
