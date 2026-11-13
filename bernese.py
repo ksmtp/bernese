@@ -2866,6 +2866,18 @@ def _fmt_ts(v):
         pass
     return v
 
+def _ts_parse(v):
+    """(epoch int, 'YYYY-MM-DD') for a BloodHound timestamp prop; (-1, '-') when unset
+    (missing, 0 = 'never', or -1). The int is a clean sort key, newest last."""
+    try:
+        iv = int(v)
+        if iv > 0:
+            import datetime
+            return iv, datetime.datetime.fromtimestamp(iv, datetime.timezone.utc).strftime("%Y-%m-%d")
+    except (ValueError, TypeError, OSError, OverflowError):
+        pass
+    return -1, "-"
+
 _JUICY_RIGHTS = ("DCSync", "GenericAll", "GenericWrite", "WriteDacl", "WriteOwner",
                  "Owns", "ForceChangePassword", "AddKeyCredentialLink", "AddMember",
                  "AdminTo", "AllowedToAct", "ReadLAPSPassword", "ReadGMSAPassword",
@@ -4358,6 +4370,7 @@ STAR = "◆"                        # ◆ — high-value (one diamond glyph for 
 CHECK = "✓"                       # ✓ — right you already hold
 PRIV_MARK = "◆"                   # ◆ — privileged (effectively-admin) principal
 KERB = "⚑kerb"                    # ⚑ — kerberoastable user (SPN set)
+KERB_MARK = "\U0001f39f"               # 🎟 — kerberoastable user (SPN set): crack = creds
 KERB_STYLE = "purple"                 # plain (non-privileged) kerberoastable users — purple
 PRIV_STYLE = "bold orange1"           # privileged USERS — orange, never green-like-a-user
 PRIV_COMP_STYLE = "bold magenta"      # privileged / high-value COMPUTERS — distinct from users
@@ -4467,8 +4480,10 @@ def ntext(g, sid, star=True, priv=None, kind=True):
         t.append(f"  {STAR}", style="bold red")
     elif priv is not None and sid in priv:
         t.append(f"  {PRIV_MARK}", style=name_style)
-    # kerberoastable users are shown by their PURPLE name colour (see name_style_for),
-    # not an inline flag/tag.
+    # kerberoastable users also get a 🎟 ticket marker (on top of the purple name) — so a
+    # roastable DA reads "name ◆ 🎟": high-value AND crackable to creds.
+    if is_kerberoastable(g, sid):
+        t.append(f" {KERB_MARK}", style="yellow")
     return t
 
 
@@ -5175,7 +5190,7 @@ class PrincipalTable(Vertical):
         self._col_names = (["NAME"] + (["KIND"] if self.show_kind else [])
                            + (["REACH"] if self.reach else [])
                            + (["ESCALATION"] if self.escalation else [])
-                           + ["GROUPS", "CTRL", "DESC", "TAGS"])
+                           + ["GROUPS", "CTRL", "PWSET", "LOGON", "DESC", "TAGS"])
         self._col_keys = list(t.add_columns(*self._col_names))
         self.query_one("#tblhelp", Static).update(self._help_bar())
         self.rebuild()
@@ -5214,6 +5229,14 @@ class PrincipalTable(Vertical):
             return 999, Text("- (own something: ^o)", style="grey42")
         return 999, Text("-", style="grey42")
 
+    _TS_PROP = {"PWSET": "pwdlastset", "LOGON": "lastlogontimestamp"}
+
+    def _ts(self, s, col):
+        """(epoch sort key, display Text) for the PWSET / LOGON timestamp columns."""
+        n = self.g.nodes.get(s)
+        epoch, txt = _ts_parse(n.p(self._TS_PROP[col]) if n else None)
+        return epoch, Text(txt, style="grey70" if epoch > 0 else "grey42")
+
     def _ctrl_count(self, s):
         return sum(1 for (_d, l) in self.g.ctrl.get(s, []) if l != "MemberOf")
 
@@ -5243,6 +5266,8 @@ class PrincipalTable(Vertical):
             return len(bh._direct_groups(g, s))
         if col == "CTRL":
             return self._ctrl_count(s)
+        if col in self._TS_PROP:
+            return self._ts(s, col)[0]                             # epoch — newest last
         if col == "DESC":
             return self._desc(s).lower()
         if col == "TAGS":
@@ -5263,6 +5288,8 @@ class PrincipalTable(Vertical):
             return ", ".join(bh._group_names(g, s, limit=99)).lower()
         if col == "CTRL":
             return str(self._ctrl_count(s))
+        if col in self._TS_PROP:
+            return self._ts(s, col)[1].plain.lower()
         if col == "DESC":
             return self._desc(s).lower()
         if col == "TAGS":
@@ -5318,6 +5345,7 @@ class PrincipalTable(Vertical):
                 route, reaches = self._escalation(s)
                 cells.append(Text(route, style="bold red" if reaches else "grey50"))
             cells += [Text(grps, style="grey70"), self._ctrl_cell(s),
+                      self._ts(s, "PWSET")[1], self._ts(s, "LOGON")[1],
                       Text(self._desc(s), style="grey62"), node_tags(g, s)]
             t.add_row(*cells, key=s)
         if self.sort_col is None:
