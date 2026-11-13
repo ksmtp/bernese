@@ -82,10 +82,13 @@ def header(s):
 # --------------------------------------------------------------------------- #
 HIGHVALUE_RIDS = {
     "512": "Domain Admins", "516": "Domain Controllers", "518": "Schema Admins",
-    "519": "Enterprise Admins", "520": "Group Policy Creator Owners",
+    "519": "Enterprise Admins",
     "521": "Read-only Domain Controllers", "526": "Key Admins",
     "527": "Enterprise Key Admins", "502": "krbtgt",
 }
+# NB: RID 520 (Group Policy Creator Owners) is deliberately NOT high-value — membership
+# only lets you CREATE new GPOs, not link them to an OU/domain, so it is a privesc path
+# only when paired with a separate WriteGPLink right (which that membership does not grant).
 # Builtin groups are keyed by the S-1-5-32-RID suffix because collectors prefix
 # them with the domain (e.g. "DOMAIN.LOCAL-S-1-5-32-544").
 HIGHVALUE_BUILTIN = {
@@ -681,7 +684,7 @@ def _is_admin(g, sid):
     if g.is_highvalue(sid):
         return True
     rid = sid.rsplit("-", 1)[-1]
-    if rid in ("500", "512", "519", "518", "520", "516", "502"):
+    if rid in ("500", "512", "519", "518", "516", "502"):   # not 520 (GPCO — create-only)
         return True
     n = g.nodes.get(sid)
     if n and n.p("admincount"):
@@ -815,7 +818,7 @@ def _da_member_set(g):
     """SIDs that are members (recursive) of Domain/Enterprise/Schema Admins etc."""
     out = set()
     for sid, n in g.nodes.items():
-        if n.kind == "Group" and sid.rsplit("-", 1)[-1] in ("512", "519", "518", "516", "520"):
+        if n.kind == "Group" and sid.rsplit("-", 1)[-1] in ("512", "519", "518", "516"):
             for m in _expand_members(g, sid):
                 out.add(m)
     return out
@@ -4585,9 +4588,6 @@ WHY_HIGHVALUE = {
     "519": "Enterprise Admins: full admin across the entire AD forest.",
     "518": "Schema Admins: can change the AD schema — forest-wide and permanent.",
     "516": "Domain Controllers: hosts the directory; SYSTEM on a DC = domain compromise.",
-    "520": ("Group Policy Creator Owners: members CREATE GPOs and own the ones they make, "
-            "so they can author/link policy that runs as SYSTEM on domain-joined machines "
-            "(scheduled task, script, add-local-admin) — a path to domain takeover."),
     "521": "Read-only Domain Controllers: hold a filtered replica of directory secrets.",
     "526": "Key Admins: can write msDS-KeyCredentialLink — shadow-credential any account.",
     "527": "Enterprise Key Admins: key-credential rights across the forest.",
