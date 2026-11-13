@@ -4339,8 +4339,10 @@ try:
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.screen import Screen
-    from textual.widgets import DataTable, Footer, Header, Input, OptionList, Static, Tree
+    from textual.widgets import (Button, DataTable, Footer, Header, Input, OptionList,
+                                 SelectionList, Static, Tree)
     from textual.widgets.option_list import Option
+    from textual.widgets.selection_list import Selection
     _HAS_TUI = True
 except ImportError:                   # textual/rich absent -> stub the names so the class
     _HAS_TUI = False                  # definitions below still import (the TUI won't run;
@@ -4355,6 +4357,7 @@ except ImportError:                   # textual/rich absent -> stub the names so
     ComposeResult = object
     App = Screen = Vertical = Horizontal = VerticalScroll = _Stub
     Text = DataTable = Footer = Header = Input = OptionList = Static = Tree = Option = _Stub
+    Button = SelectionList = Selection = _Stub
     Binding = _Stub
 
 
@@ -4438,32 +4441,71 @@ def spn_services(n):
     return out
 
 
-EXPORT_PRESETS = [
-    ("name", "Name only (one per line — wordlist)"),
-    ("name_os", "Name + OS"),
-    ("name_desc", "Name + description"),
-    ("name_tags", "Name + tags (SPN / AS-REP / DC / disabled …)"),
-    ("full", "Full — name, kind, groups, control, desc, tags"),
+# exportable fields: (id, label). The export screen lets you tick any combination; the
+# chosen fields are written tab-separated in THIS order (the order they appear here).
+EXPORT_FIELDS = [
+    ("name", "Name"),
+    ("sam", "sAMAccountName"),
+    ("kind", "Kind"),
+    ("enabled", "Enabled / disabled"),
+    ("os", "Operating system"),
+    ("spn", "SPN(s)"),
+    ("pwset", "Password last set"),
+    ("logon", "Last logon"),
+    ("groups", "Groups (all)"),
+    ("ctrl", "Control count"),
+    ("desc", "Description"),
+    ("tags", "Tags (SPN / AS-REP / DC / disabled …)"),
+    ("sid", "SID"),
 ]
+EXPORT_DEFAULT = ["name", "pwset", "logon", "tags"]      # pre-ticked when the screen opens
+# back-compat aliases so export_line(..., "name") etc. still work (and the smoke test)
+_EXPORT_PRESETS = {
+    "name": ["name"], "name_os": ["name", "os"], "name_desc": ["name", "desc"],
+    "name_tags": ["name", "tags"],
+    "full": ["name", "kind", "groups", "ctrl", "desc", "tags"],
+}
 
 
-def export_line(g, s, preset):
-    """One output line for a principal under the chosen export preset (tab-separated)."""
+def _export_field(g, s, fid):
+    """The string value of one exportable field for a principal."""
     n = g.nodes.get(s)
-    nm = short(g, s)
-    if preset == "name":
-        return nm
-    if preset == "name_os":
-        return f"{nm}\t{(n.p('operatingsystem') if n else '') or ''}"
-    if preset == "name_desc":
-        return f"{nm}\t{((n.p('description') if n else '') or '').replace(chr(10), ' ')}"
-    if preset == "name_tags":
-        return f"{nm}\t{node_tags(g, s).plain.strip()}"
-    kind = n.kind if n else "?"
-    grps = ", ".join(bh._group_names(g, s, limit=99))
-    ctrl = sum(1 for (_d, l) in g.ctrl.get(s, []) if l != "MemberOf")
-    desc = ((n.p("description") if n else "") or "").replace("\n", " ")
-    return f"{nm}\t{kind}\t{grps}\t{ctrl}\t{desc}\t{node_tags(g, s).plain.strip()}"
+    if fid == "name":
+        return short(g, s)
+    if fid == "sam":
+        return (n.p("samaccountname") if n else "") or ""
+    if fid == "kind":
+        return n.kind if n else "?"
+    if fid == "enabled":
+        v = n.p("enabled") if n else None
+        return "" if v is None else ("enabled" if bh._truthy(v) else "disabled")
+    if fid == "os":
+        return (n.p("operatingsystem") if n else "") or ""
+    if fid == "spn":
+        return ", ".join(spn_services(n)) if n else ""
+    if fid == "pwset":
+        return _ts_parse(n.p("pwdlastset") if n else None)[1]
+    if fid == "logon":
+        return _ts_parse(n.p("lastlogontimestamp") if n else None)[1]
+    if fid == "groups":
+        return ", ".join(bh._group_names(g, s, limit=99))
+    if fid == "ctrl":
+        return str(sum(1 for (_d, l) in g.ctrl.get(s, []) if l != "MemberOf"))
+    if fid == "desc":
+        return ((n.p("description") if n else "") or "").replace("\n", " ")
+    if fid == "tags":
+        return node_tags(g, s).plain.strip()
+    if fid == "sid":
+        return s
+    return ""
+
+
+def export_line(g, s, fields):
+    """One tab-separated output line for a principal. `fields` is a list of field ids
+    (see EXPORT_FIELDS); a preset name string is also accepted for back-compat."""
+    if isinstance(fields, str):
+        fields = _EXPORT_PRESETS.get(fields, ["name"])
+    return "\t".join(_export_field(g, s, f) for f in fields)
 
 
 def ntext(g, sid, star=True, priv=None, kind=True):
@@ -5437,8 +5479,9 @@ class PrincipalTable(Vertical):
             rows.sort(key=lambda s: self._col_key(s, col), reverse=self.sort_desc)
         return rows
 
-    def export_to_file(self, preset):
-        """Write the current (filtered + sorted) list to a .txt in the working dir."""
+    def export_to_file(self, fields):
+        """Write the current (filtered + sorted) list to a tab-separated .txt in the
+        working dir. `fields` is a list of field ids (or a legacy preset-name string)."""
         import os
         import time
         rows = self._export_sids()
@@ -5446,7 +5489,7 @@ class PrincipalTable(Vertical):
         path = os.path.join(os.getcwd(), f"bernese_{slug}_{time.strftime('%Y%m%d_%H%M%S')}.txt")
         with open(path, "w") as fh:
             for s in rows:
-                fh.write(export_line(self.g, s, preset) + "\n")
+                fh.write(export_line(self.g, s, fields) + "\n")
         return path, len(rows)
 
     def on_key(self, event):
@@ -6905,9 +6948,13 @@ class NodeInfoScreen(Screen):
 # export a principal list to a .txt — pick which fields
 # --------------------------------------------------------------------------- #
 class ExportScreen(Screen):
-    """Pick the fields, then write the table's current (filtered + sorted) rows to a
-    .txt in the working directory."""
-    BINDINGS = [Binding("escape", "back", "Cancel")]
+    """Tick the columns you want, then write the table's current (filtered + sorted) rows
+    to a tab-separated .txt in the working directory. Space toggles a column, Ctrl+S (or
+    the Export button) writes the file, Esc cancels."""
+    BINDINGS = [
+        Binding("escape", "back", "Cancel"),
+        Binding("ctrl+s", "do_export", "Export", priority=True),
+    ]
 
     def __init__(self, table):
         super().__init__()
@@ -6915,23 +6962,37 @@ class ExportScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
-        opts = [Option(Text(label), id=fid) for fid, label in EXPORT_PRESETS]
-        ol = OptionList(*opts, id="exportlist")
+        sel = SelectionList(
+            *[Selection(label, fid, fid in EXPORT_DEFAULT) for fid, label in EXPORT_FIELDS],
+            id="exportlist")
         n = len(self.table._export_sids())
-        ol.border_title = f"export {n} rows from “{self.table.title}” — pick fields · Enter · Esc cancel"
-        yield ol
+        sel.border_title = (f"export {n} rows from “{self.table.title}” — Space toggles a "
+                            "column · Ctrl+S writes the file · Esc cancels")
+        yield sel
+        yield Button("Export selected columns  (Ctrl+S)", id="exportbtn", variant="primary")
         yield Footer()
 
     def on_mount(self):
-        self.query_one("#exportlist", OptionList).focus()
+        self.query_one("#exportlist", SelectionList).focus()
 
     def action_back(self):
         self.app.pop_screen()
 
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected):
-        path, count = self.table.export_to_file(event.option.id)
+    def on_button_pressed(self, event: Button.Pressed):
+        self.action_do_export()
+
+    def action_do_export(self):
+        fields = list(self.query_one("#exportlist", SelectionList).selected)
+        if not fields:
+            self.app.notify("Pick at least one column (Space to tick).", title="Export",
+                            severity="warning", timeout=5)
+            return
+        # write in the canonical EXPORT_FIELDS order, not the toggle order
+        fields = [fid for fid, _l in EXPORT_FIELDS if fid in fields]
+        path, count = self.table.export_to_file(fields)
         self.app.pop_screen()
-        self.app.notify(f"Exported {count} rows → {path}", title="Export", timeout=8)
+        self.app.notify(f"Exported {count} rows ({len(fields)} cols) → {path}",
+                        title="Export", timeout=8)
 
 
 # --------------------------------------------------------------------------- #
@@ -7396,7 +7457,8 @@ class BerneseApp(App):
         height: auto; border: none; background: transparent; margin: 0 0 1 0;
     }
     #niview { height: 1fr; }
-    #exportlist { height: auto; max-height: 80%; border: round $primary; margin: 1 2; }
+    #exportlist { height: auto; max-height: 70%; border: round $primary; margin: 1 2; }
+    #exportbtn { margin: 0 2 1 2; width: auto; }
     #maqtree { height: 1fr; border: round $primary; }
     TextPane { height: 1fr; border: round $primary; padding: 0 1; overflow-x: auto; overflow-y: auto; }
     TextPane #body { width: auto; }
