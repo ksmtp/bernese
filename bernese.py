@@ -5552,10 +5552,59 @@ class AttackTreeBase(Vertical):
     explorer and the rights browser. Space/Enter drops a node down; a leaf opens its
     full searchable list or drills into its own attack tree."""
 
+    BINDINGS = [Binding("y", "yank", "Copy line/section")]
+
     def compose(self) -> ComposeResult:
         tree = Tree("", id="tree")
         tree.show_root = True
         yield tree
+
+    def _focused_tree(self):
+        """The tree currently holding focus (a view may stack several), else the first."""
+        trees = list(self.query(Tree))
+        for t in trees:
+            if t.has_focus:
+                return t
+        return trees[0] if trees else None
+
+    def action_yank(self):
+        """Copy the selected tree line to the system clipboard (OSC 52). On a leaf of the
+        form 'label: value' it copies just the value (GUID/SID/date — ready to paste); on a
+        section header (a node with children) it copies the whole block, one line each."""
+        import re
+        t = self._focused_tree()
+        node = t.cursor_node if t else None
+        if node is None:
+            return
+
+        def plain(n):
+            lab = n.label
+            return (lab.plain if hasattr(lab, "plain") else str(lab)).rstrip()
+
+        if node.children:                              # a header / section — copy the block
+            lines = []
+
+            def walk(n, depth=0):
+                lines.append(("  " * depth) + plain(n))
+                for c in n.children:
+                    walk(c, depth + 1)
+
+            walk(node)
+            copied = "\n".join(lines).strip()
+            what = f"{len(lines)} lines"
+        else:                                          # a single line — copy its value
+            text = plain(node).strip()
+            m = re.match(r"^[^:]{1,45}:\s+(.+)$", text)
+            copied = m.group(1).strip() if m else text
+            what = copied[:50]
+        if not copied:
+            return
+        try:
+            self.app.copy_to_clipboard(copied)
+            self.app.notify(f"Copied {what}", title="Clipboard", timeout=2)
+        except Exception as e:                         # terminal without OSC 52, etc.
+            self.app.notify(f"Copy failed: {e}", title="Clipboard",
+                            severity="error", timeout=4)
 
     @property
     def g(self):
@@ -6948,7 +6997,7 @@ class NodeInfoView(AttackTreeBase):
     def on_mount(self):
         g, sid = self.g, self.sid
         tree = self.query_one("#tree", Tree)
-        tree.border_title = f"node info: {short(g, sid)}  —  Enter/Space drill · i info on selected · Esc back"
+        tree.border_title = f"node info: {short(g, sid)}  —  Enter/Space drill · i info · y copy · Esc back"
         tree.root.set_label(self._line(sid))
         tree.root.data = {"sid": sid, "anc": frozenset({sid}), "loaded": True}
         self._add_owned_path(tree.root, sid)
