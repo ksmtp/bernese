@@ -4946,9 +4946,9 @@ def _fastest_win(g, app):
     laps = sorted({r for r, _c in bh._laps_readers(g)})
     if laps:
         return f"{short(g, laps[0])} reads LAPS ⇒ local admin", "laps"
-    # otherwise the quickest route from the start or any owned foothold
+    # otherwise the quickest route from any owned foothold
     best = None
-    for s in [app.start] + sorted(app.owned - {app.start}, key=lambda s: short(g, s).lower()):
+    for s in sorted(app.owned, key=lambda s: short(g, s).lower()):
         if not s or g.is_highvalue(s):
             continue
         rt = route_tag(g, s)
@@ -4956,8 +4956,7 @@ def _fastest_win(g, app):
             best = (s, rt)
     if best:
         s, (tech, tgt, hops) = best
-        return (f"{short(g, s)}: {tech} ⇒ {_tgt_short(tgt)} ({hops}h)",
-                "start_path" if s == app.start else s)
+        return f"{short(g, s)}: {tech} ⇒ {_tgt_short(tgt)} ({hops}h)", s
     return None, None
 
 
@@ -5220,7 +5219,7 @@ class PrincipalTable(Vertical):
         if self.reach:
             keys += [("Enter", "node info + path"), ("^t", "target"), ("^o", "own")]
         else:
-            keys += [("^s", "set start"), ("^o", "own"), ("^t", "target")]
+            keys += [("Enter", "explore"), ("^o", "own"), ("^t", "target")]
         keys += [("^e", "enabled-only"), ("^x", "export")]
         for key, what in keys:
             t.append(f" {key} ", style="bold black on grey58")
@@ -5606,20 +5605,16 @@ class AttackTreeBase(Vertical):
                 -sum(1 for (_d, l) in g.ctrl.get(s, []) if l != "MemberOf"), short(g, s).lower())
 
     def _owned_reach(self):
-        """Map a principal sid -> sorted [(owner_name, "owned"|"start")] for every principal
-        that your OWNED set (or the current start) reaches via membership — i.e. owning that
-        account gives you this principal's access. Lets a view annotate a holder/group with
-        the owned/start principal that already grants it, instead of a duplicate branch."""
+        """Map a principal sid -> sorted [(owner_name, "owned")] for every principal your
+        OWNED set reaches via membership — i.e. owning that account gives you this principal's
+        access. Lets a view annotate a holder/group with the owned principal that already
+        grants it, instead of a duplicate branch."""
         g = self.g
-        owned = set(self.app.owned)
-        sources = [(p, "owned") for p in owned]
-        if self.app.start and self.app.start not in owned:
-            sources.append((self.app.start, "start"))
         reach = {}
-        for p, src in sources:
+        for p in set(self.app.owned):
             pname = short(g, p)
             for member in bh._principal_closure(g, p):
-                reach.setdefault(member, {}).setdefault(pname, src)
+                reach.setdefault(member, {}).setdefault(pname, "owned")
         return {k: sorted(v.items()) for k, v in reach.items()}
 
     def _owned_tag(self, line, sid, reach):
@@ -5815,14 +5810,20 @@ class AttackTreeBase(Vertical):
         if nodes:
             nodes[-1].allow_expand = False             # the final target is the leaf
 
-    def _category(self, root, label, sids, style="bold", expand=False):
+    def _category(self, root, label, sids, style="bold", expand=False, tag_owned=False):
+        """When `tag_owned`, each row gets the green ✓ owned/start tag if your owned set
+        reaches it (same flag as the rights search), so held entries stand out in place."""
         g = self.g
         sids = list(dict.fromkeys(sids))
         if not sids:
             return
+        reach = self._owned_reach() if tag_owned else None
         cat = root.add(Text(f"{label}  ({len(sids)})", style=style), expand=expand)
         for s in sorted(sids, key=self._list_sort_key)[:INLINE_CAP]:
-            child = cat.add(self._line(s), data={"sid": s, "anc": frozenset({s})})
+            line = self._line(s)
+            if reach is not None:
+                self._owned_tag(line, s, reach)
+            child = cat.add(line, data={"sid": s, "anc": frozenset({s})})
             child.allow_expand = self._expandable(s, frozenset({s}))
         if len(sids) > INLINE_CAP:
             cat.add(Text(f"... +{len(sids) - INLINE_CAP} more (open list)", style="grey50"),
@@ -5926,12 +5927,15 @@ class ExploreView(AttackTreeBase):
         # visually disconnected below it — the out-of-band routes to DA. A separate widget
         # (not a branch off the root) is how we say "these are NOT a path from this node".
         with VerticalScroll(id="treescroll"):
+            # OWNED SET first (top): all your footholds together. Then the focused node's
+            # full attack tree, then out-of-band routes to DA, then your marked targets —
+            # each a SEPARATE tree so the sections read as distinct, unconnected blocks.
+            owned = Tree("", id="ownedtree")       # all your footholds — top of the view
+            owned.show_root = True
+            yield owned
             main = Tree("", id="tree")
             main.show_root = True
             yield main
-            owned = Tree("", id="ownedtree")       # your other footholds — its own tree
-            owned.show_root = True
-            yield owned
             other = Tree("", id="othertree")
             other.show_root = True
             yield other
@@ -5947,22 +5951,36 @@ class ExploreView(AttackTreeBase):
 
     def show_empty(self):
         self.current = None
-        self.query_one("#treescroll").border_title = "attack tree — pick a start (menu: Users / Computers)"
+        self.app.start = None
         tree = self.query_one("#tree", Tree)
         tree.clear()
-        tree.root.set_label(Text("no start node selected", style="grey62"))
-        tree.root.data = None
-        self.query_one("#ownedtree", Tree).clear()
-        self.query_one("#ownedtree", Tree).display = False
-        other = self.query_one("#othertree", Tree)
-        other.clear(); other.root.set_label(Text("")); other.root.data = None
-        other.display = False                    # no stray empty ▶ under "no start"
-        self._fill_target_tree()                 # targets show even before a start is picked
-        self.app.set_detail(intro=Text(
-            "Mark the principals you control with Ctrl+O, and the objects you are going after "
-            "with Ctrl+T.\n\nThen open Targets (menu, or press t) to see whether your owned "
-            "set can reach each one and how. Pick any node as a start (Users / Computers) to "
-            "walk its full attack tree.", style="grey62"))
+        self._fill_owned_tree()                  # OWNED SET is the content when you own things
+        has_owned = bool([s for s in self.app.owned if self.g.nodes.get(s)])
+        if has_owned:
+            tree.display = False                 # footholds shown fully in OWNED SET above
+            self.query_one("#treescroll").border_title = (
+                "your footholds — Space/Enter drop down * i info * ^o owned * Bksp back")
+            self._fill_other_tree()
+            self._fill_target_tree()
+            self.app.set_detail(intro=Text(
+                "OWNED SET lists every foothold you hold and what each can take over. "
+                "Other routes to DA and your targets follow below. Mark more with Ctrl+O, "
+                "objects you're after with Ctrl+T.", style="grey62"))
+        else:
+            tree.display = True
+            self.query_one("#treescroll").border_title = "attack tree — mark footholds with Ctrl+O"
+            tree.root.set_label(Text("no footholds yet — mark the principals you control with Ctrl+O",
+                                     style="grey62"))
+            tree.root.data = None
+            other = self.query_one("#othertree", Tree)
+            other.clear(); other.root.set_label(Text("")); other.root.data = None
+            other.display = False
+            self._fill_target_tree()
+            self.app.set_detail(intro=Text(
+                "Mark the principals you control with Ctrl+O and they collect here as your "
+                "OWNED SET, each showing what it can take over. Mark objects you're going "
+                "after with Ctrl+T, then open Targets (press t) to check reachability.",
+                style="grey62"))
 
     def _fill_other_tree(self):
         """Fill the SEPARATE lower tree with the domain-wide routes to DA that need NO ACL
@@ -6053,28 +6071,28 @@ class ExploreView(AttackTreeBase):
         tree.root.expand()
 
     def _fill_owned_tree(self):
-        """Fill the SEPARATE owned tree with your other footholds (every owned principal
-        except the current start), each with its route to high-value auto-expanded. It is
-        its own tree — like OTHER ROUTES — so the owned set reads as its own thing, not a
-        branch of the start node's attack tree. (Ctrl+S on one pivots to it.)"""
+        """Fill the OWNED SET tree (top of the view) with ALL your footholds together, each
+        fully expanded to its route to high-value + what it is in and can take over. This is
+        the whole attack surface of what you hold — there is no separate 'focused' tree; the
+        tree hides only when you own nothing."""
         g = self.g
-        owned = [s for s in self.app.owned if g.nodes.get(s) and s != self.current]
+        owned = [s for s in self.app.owned if g.nodes.get(s)]
         tree = self.query_one("#ownedtree", Tree)
         tree.clear()
-        if not owned:                              # nothing to show -> hide the tree entirely
+        if not owned:                              # own nothing -> hide the tree entirely
             tree.display = False
             return
         tree.display = True
         tree.root.data = None
-        tree.root.set_label(banner(f"{OWNED} OWNED SET ({len(owned)}) — your footholds "
-                                   "(Ctrl+S pivots)", bg="dark_green"))
+        tree.root.set_label(banner(f"{OWNED} OWNED SET ({len(owned)}) — your footholds and "
+                                   "what each can take over", bg="dark_green"))
         few = len(owned) <= 5                      # auto-open group rights only for a few
         for s in sorted(owned, key=self._list_sort_key):
             anc = frozenset({s})
             child = tree.root.add(self._line(s), data={"sid": s, "anc": anc})
-            # pre-attach this foothold's shortest route to high-value, then — like the
-            # start node — everything it is in and can take over, so a group's OTHER
-            # rights (not just the one hop on the shortest path) show here too.
+            # pre-attach this foothold's shortest route to high-value, then everything it is
+            # in and can take over, so a group's OTHER rights (not just the shortest-path
+            # hop) show here too.
             tgt = None
             if not g.is_highvalue(s):
                 reach = g.reachable(s)
@@ -6111,43 +6129,49 @@ class ExploreView(AttackTreeBase):
         self.current = sid
         self.app.start = sid
         g, priv = self.g, self.app.priv
-        self.query_one("#treescroll").border_title = (
-            f"attack tree: {short(g, sid)}  —  Space/Enter drop down * "
-            "i info * ^s set start * ^o owned * Bksp back")
         tree = self.query_one("#tree", Tree)
         tree.clear()
-        tree.root.set_label(self._line(sid))
-        tree.root.data = {"sid": sid, "anc": frozenset({sid}), "loaded": True}
 
-        # --- everything tied to THIS node (its own groups/privileges) ---
-        kindword = "user" if g.nodes[sid].kind == "User" else g.nodes[sid].kind.lower()
-        self._add_shortest_path(tree.root, sid)
-        self._section(tree.root, f"DIRECT — what this {kindword} is in and can take over")
-        self._add_attack_children(tree.root, sid, frozenset({sid}))
-        comps = [s for s in g.reachable(sid) if s != sid and g.nodes.get(s) and g.nodes[s].kind == "Computer"]
-        self._category(tree.root, "Key targets", [s for s in comps if bh._computer_value(g, s, priv)[0]])
-        if g.nodes[sid].kind == "User":
-            self._category(tree.root, "Local admin on", [d for (d, l) in g.ctrl.get(sid, []) if l == "AdminTo"])
-            self._category(tree.root, "Has a session on",
-                           [c for c, cn in g.nodes.items() if cn.kind == "Computer" and sid in cn.sessions])
-        if g.nodes[sid].kind == "Group":
-            self._category(tree.root, "Members", [m for m in bh._expand_members(g, sid)
-                           if g.nodes.get(m) and g.nodes[m].kind in ("User", "Computer")])
-        # (the "Controlled by" list is dropped from the attack tree — it is inbound ACLs,
-        # not an outbound takeover path; it still lives in node info.)
+        if sid in self.app.owned:
+            # the node is one of your footholds — it's rendered IN FULL inside OWNED SET at
+            # the top, so don't duplicate it as a separate tree here.
+            tree.display = False
+            self.query_one("#treescroll").border_title = (
+                "your footholds — Space/Enter drop down * i info * ^o owned * Bksp back")
+        else:
+            tree.display = True
+            self.query_one("#treescroll").border_title = (
+                f"exploring {short(g, sid)}  —  Space/Enter drop down * i info * ^o owned * Bksp back")
+            tree.root.set_label(self._line(sid))
+            tree.root.data = {"sid": sid, "anc": frozenset({sid}), "loaded": True}
+            # --- everything tied to THIS node (its own groups/privileges) ---
+            kindword = "user" if g.nodes[sid].kind == "User" else g.nodes[sid].kind.lower()
+            self._add_shortest_path(tree.root, sid)
+            self._section(tree.root, f"DIRECT — what this {kindword} is in and can take over")
+            self._add_attack_children(tree.root, sid, frozenset({sid}))
+            comps = [s for s in g.reachable(sid) if s != sid and g.nodes.get(s) and g.nodes[s].kind == "Computer"]
+            self._category(tree.root, "Key targets", [s for s in comps if bh._computer_value(g, s, priv)[0]])
+            if g.nodes[sid].kind == "User":
+                self._category(tree.root, "Local admin on", [d for (d, l) in g.ctrl.get(sid, []) if l == "AdminTo"])
+                self._category(tree.root, "Has a session on",
+                               [c for c, cn in g.nodes.items() if cn.kind == "Computer" and sid in cn.sessions])
+            if g.nodes[sid].kind == "Group":
+                self._category(tree.root, "Members", [m for m in bh._expand_members(g, sid)
+                               if g.nodes.get(m) and g.nodes[m].kind in ("User", "Computer")])
+            tree.root.expand()
+            kids = [c for c in tree.root.children if (c.data or {}).get("sid")]
+            if len(kids) <= 20:
+                for c in kids:
+                    self._populate(c)
+                    c.expand()
 
-        # your other footholds + the domain-wide out-of-band wins — each its OWN tree below
+        # OWNED SET (all footholds), domain-wide out-of-band wins, your targets — each its
+        # own tree. OWNED SET sits above; the exploring tree (if any) is between.
         self._fill_owned_tree()
         self._fill_other_tree()
         self._fill_target_tree()
-        tree.root.expand()
-        kids = [c for c in tree.root.children if (c.data or {}).get("sid")]
-        if len(kids) <= 20:
-            for c in kids:
-                self._populate(c)
-                c.expand()
         self._detail(sid)
-        tree.focus()
+        (self.query_one("#ownedtree", Tree) if sid in self.app.owned else tree).focus()
 
     def root_back(self):
         if self.history:
@@ -6163,10 +6187,12 @@ class ExploreView(AttackTreeBase):
         if not sid:
             return
         self.app.owned.discard(sid) if sid in self.app.owned else self.app.owned.add(sid)
-        # reload the tree so the OWNED SET section (top of the tree) reflects the change —
-        # just relabeling the cursor node would leave the owned footholds stale.
+        # reload so the OWNED SET (top of the view) reflects the change — a node that just
+        # became owned moves into the owned set and its separate exploring tree is dropped.
         if self.current:
             self.load(self.current, push=False)
+        else:
+            self.show_empty()
         self._detail(sid)
 
 
@@ -6192,7 +6218,7 @@ class RightsTree(AttackTreeBase):
         # a right is "held" when one of its holders is a principal you reach
         held = {r for r, hs in holders.items() if hs & yours}
         tree = self.query_one("#tree", Tree)
-        have = "start / owned" if (self.app.owned or self.app.start) else "nothing selected yet"
+        have = "owned set" if self.app.owned else "nothing owned yet"
         tree.border_title = ("control rights — Space/Enter drops holders down · "
                              f"{CHECK} = held by your {have} · Esc back")
         tree.root.set_label(Text("control rights present in this domain", style="bold"))
@@ -6208,7 +6234,7 @@ class RightsTree(AttackTreeBase):
         tree.root.expand()
         self.app.set_detail(intro=Text(
             "Pick a right and drop it down to see who holds it. A holder you control "
-            f"(or are a member of) is flagged {CHECK} with the owned/start principal that "
+            f"(or are a member of) is flagged {CHECK} with the owned principal that "
             "gives you it. Drill any holder further.", style="grey62"))
         tree.focus()
 
@@ -6245,29 +6271,20 @@ class EscalationView(AttackTreeBase):
         starts.sort(key=lambda x: x[1])                 # fewest hops first
         return starts
 
-    # dangerous rights that take over another account/group (even if the chain never
-    # reaches a high-value target — still a privesc the operator will want to walk).
-    _TAKEOVER_RIGHTS = {"ForceChangePassword", "GenericAll", "GenericWrite", "WriteDacl",
-                        "WriteOwner", "Owns", "Owner", "AddMember", "AddSelf",
-                        "AddKeyCredentialLink", "AllExtendedRights"}
-
-    def _lateral_takeover(self, exclude):
-        """Principals that can take over another user/group by ACL — the full privesc
-        surface, NOT just the chains reaching a high-value node. Counts only DIRECT takeover
-        edges on the principal itself, so a user that merely INHERITS a group's rights is not
-        duplicated — it is represented by that group (annotated with the owned/start member
-        instead). Returns [(sid, n_targets)] widest-first; `exclude` drops the ACL start points."""
+    def _danger_holders(self, exclude):
+        """Every non-admin user/group that holds a DANGEROUS right (GenericAll / WriteDacl /
+        ForceChangePassword / AddKeyCredentialLink / ReadLAPSPassword / ReadGMSAPassword …)
+        over ANY object — the full privesc surface, even when the chain never reaches a
+        high-value node. Counts DIRECT edges only (a principal that merely INHERITS a group's
+        rights is represented by that group). Returns [(sid, n_objects)] widest-first;
+        `exclude` drops any sids already shown elsewhere."""
         g = self.g
         out = []
         for n in g.nodes.values():
             if n.kind not in ("User", "Group") or bh._is_admin(g, n.sid) or n.sid in exclude:
                 continue
-            tgts = set()
-            for (d, l) in g.ctrl.get(n.sid, []):               # DIRECT edges only
-                if l in self._TAKEOVER_RIGHTS:
-                    dn = g.nodes.get(d)
-                    if dn and dn.kind in ("User", "Group") and d != n.sid:
-                        tgts.add(d)
+            tgts = {d for (d, l) in g.ctrl.get(n.sid, [])      # DIRECT edges only
+                    if l in bh._DANGER and d != n.sid and g.nodes.get(d)}
             if tgts:
                 out.append((n.sid, len(tgts)))
         out.sort(key=lambda x: (-x[1], short(g, x[0]).lower()))
@@ -6277,7 +6294,7 @@ class EscalationView(AttackTreeBase):
         # each route family is its OWN tree, stacked in one scroll box — so the sections
         # read as separate, unconnected routes rather than branches off a shared root.
         with VerticalScroll(id="escscroll"):
-            for tid in ("esc_cred", "esc_acl", "esc_lat", "esc_foot"):
+            for tid in ("esc_own", "esc_cred", "esc_acl", "esc_lat", "esc_foot"):
                 t = Tree("", id=tid)
                 t.show_root = True
                 yield t
@@ -6300,21 +6317,46 @@ class EscalationView(AttackTreeBase):
         kerb = [n.sid for n in g.nodes.values() if n.kind == "User"
                 and (n.p("hasspn") or n.p("serviceprincipalnames")) and n.sid.rsplit("-", 1)[-1] != "502"]
         asrep = [n.sid for n in g.nodes.values() if n.kind == "User" and n.p("dontreqpreauth")]
+        lateral = self._danger_holders(exclude=set())        # full set (shared below)
+        starts = self._acl_starts()
+        reach = self._owned_reach()                          # sid -> [(owned name, src)]
+
+        # --- FROM WHAT YOU OWN — the wins your owned set already holds -------------
+        own = self.query_one("#esc_own", Tree).root
+        own.data = None
+        own.set_label(banner(f"{OWNED} FROM WHAT YOU OWN — your privesc surface", bg="dark_green"))
+        if not self.app.owned:
+            own.add_leaf(Text("mark footholds with Ctrl+O (and kerberoastable/other accounts "
+                              "as you crack them) — what they already grant collects here",
+                              style="grey50")).allow_expand = False
+        else:
+            def mine(sids):                                  # held via an owned identity
+                return [s for s in sids if s in reach]
+            lat_mine = [s for s, _n in lateral if s in reach]
+            # NB: no separate "LAPS readers you hold" category — ReadLAPSPassword is a
+            # dangerous right, so LAPS-reader groups already appear under the one below.
+            self._category(own, "DCSync you hold", mine(sorted(dcsync)), "bold green", expand=True, tag_owned=True)
+            self._category(own, "Kerberoastable priv / DA you control", mine(roast_priv), "bold green", expand=True, tag_owned=True)
+            self._category(own, "ADCS ESC you can abuse", mine(esc_abusers), "bold green", expand=True, tag_owned=True)
+            self._category(own, "Dangerous rights you hold (take over other objects — incl. LAPS read)", lat_mine, "bold green", expand=True, tag_owned=True)
+            if not own.children:
+                own.add_leaf(Text("your owned set holds no direct credential/ACL win yet — "
+                                  "work the domain-wide routes below", style="grey50")).allow_expand = False
+        own.expand()
 
         # --- CREDENTIAL WINS ---
         cred = self.query_one("#esc_cred", Tree).root
         cred.data = None
         cred.set_label(banner("CREDENTIAL WINS — no ACL chain (usually the real path)", bg="dark_red"))
-        self._category(cred, "Kerberoastable privileged / DA accounts", roast_priv, "bold red", expand=True)
-        self._category(cred, "DCSync-capable (non-default)", sorted(dcsync), "bold red", expand=True)
-        self._category(cred, "LAPS readers → local admin", laps, "yellow", expand=True)
-        self._category(cred, "ADCS ESC abusers → domain", esc_abusers, "bold red", expand=True)
+        self._category(cred, "Kerberoastable privileged / DA accounts", roast_priv, "bold red", expand=True, tag_owned=True)
+        self._category(cred, "DCSync-capable (non-default)", sorted(dcsync), "bold red", expand=True, tag_owned=True)
+        self._category(cred, "LAPS readers → local admin", laps, "yellow", expand=True, tag_owned=True)
+        self._category(cred, "ADCS ESC abusers → domain", esc_abusers, "bold red", expand=True, tag_owned=True)
         if not cred.children:
             cred.add_leaf(Text("none", style="grey50")).allow_expand = False
         cred.expand()
 
         # --- ACL START POINTS → high-value ---
-        starts = self._acl_starts()
         acl = self.query_one("#esc_acl", Tree).root
         acl.data = None
         acl.set_label(banner(f"ACL START POINTS → high-value, fewest hops first  ({len(starts)})", bg="grey30"))
@@ -6325,6 +6367,7 @@ class EscalationView(AttackTreeBase):
             line = self._line(s)
             line.append(f"   {hops} hop{'s' if hops != 1 else ''} → {STAR} {short(g, tgt)}",
                         style="bold red")
+            self._owned_tag(line, s, reach)               # ✓ when you already hold this start
             child = acl.add(line, data={"sid": s, "anc": frozenset({s}), "loaded": True})
             self._add_path_hops(child, s, tgt)
             child.expand()
@@ -6333,42 +6376,46 @@ class EscalationView(AttackTreeBase):
                     data={"list": ("ACL start points", [s for s, _h, _t in starts])}).allow_expand = False
         acl.expand()
 
-        # --- ACL CONTROL OF OTHER ACCOUNTS (lateral takeover) ---
-        lateral = self._lateral_takeover(exclude={s for s, _h, _t in starts})
+        # --- DANGEROUS RIGHTS — every principal that can take objects over by ACL ---
+        # the FULL list; owned-reachable rows sort to the top and are flagged ✓ in place.
         lat = self.query_one("#esc_lat", Tree).root
         lat.data = None
-        lat.set_label(banner(f"ACL CONTROL OF OTHER ACCOUNTS — lateral takeover  ({len(lateral)})", bg="grey30"))
-        lat.add_leaf(Text("holds a dangerous right (ForceChangePassword / GenericAll / GenericWrite …) "
-                          "over another account — may not reach DA directly, but chain them",
+        lat.set_label(banner(f"DANGEROUS RIGHTS — groups / users that can take over other "
+                             f"objects  ({len(lateral)})", bg="grey30"))
+        lat.add_leaf(Text("holds a dangerous right (GenericAll / WriteDacl / ForceChangePassword / "
+                          "ReadLAPSPassword …) over other objects — yours first, then widest",
                           style="grey62")).allow_expand = False
         if not lateral:
             lat.add_leaf(Text("none", style="grey50")).allow_expand = False
-        reach = self._owned_reach()
+        # ones you already hold (reachable from owned) first, then by most control
+        lateral = sorted(lateral, key=lambda x: (x[0] not in reach, -x[1], short(g, x[0]).lower()))
         for s, ntgt in lateral[:INLINE_CAP]:
             line = self._line(s)
-            line.append(f"   controls {ntgt} account{'s' if ntgt != 1 else ''}", style="yellow")
-            self._owned_tag(line, s, reach)          # name the owned/start member, if any
+            line.append(f"   controls {ntgt} object{'s' if ntgt != 1 else ''}", style="yellow")
+            self._owned_tag(line, s, reach)          # name the owned member, if any
             child = lat.add(line, data={"sid": s, "anc": frozenset({s})})
             child.allow_expand = self._expandable(s, frozenset({s}))
         if len(lateral) > INLINE_CAP:
             lat.add(Text(f"... +{len(lateral) - INLINE_CAP} more (open list)", style="grey50"),
-                    data={"list": ("lateral takeover", [s for s, _n in lateral])}).allow_expand = False
+                    data={"list": ("dangerous rights", [s for s, _n in lateral])}).allow_expand = False
         lat.expand()
 
         # --- FOOTHOLDS any domain user can grab ---
         foot = self.query_one("#esc_foot", Tree).root
         foot.data = None
         foot.set_label(banner("FOOTHOLDS ANY DOMAIN USER CAN GRAB", bg="grey30"))
-        self._category(foot, "Kerberoastable", kerb, "yellow")
-        self._category(foot, "AS-REP roastable", asrep, "yellow")
+        self._category(foot, "Kerberoastable", kerb, "yellow", tag_owned=True)
+        self._category(foot, "AS-REP roastable", asrep, "yellow", tag_owned=True)
         if not foot.children:
             foot.add_leaf(Text("none", style="grey50")).allow_expand = False
         foot.expand()
 
         self.app.set_detail(intro=Text(
-            "Each route is a node — Space/Enter drops it down, Enter on a principal drills "
-            "into its own attack tree.", style="grey62"))
-        self.query_one("#esc_cred", Tree).focus()
+            "Top section = what your owned set already holds; the sections below are the "
+            "domain-wide routes, with rows you hold flagged ✓. Space/Enter drops a node "
+            "down, Enter on a principal drills into its own attack tree.", style="grey62"))
+        focus = "#esc_own" if self.app.owned else "#esc_cred"
+        self.query_one(focus, Tree).focus()
 
 
 # --------------------------------------------------------------------------- #
@@ -6718,6 +6765,18 @@ class TextPane(VerticalScroll):
         self.focus()
 
 
+def _gpo_sysvol_guid(n):
+    """The GPO's policy / SYSVOL GUID — the folder name under \\...\\SysVol\\...\\Policies\\,
+    which is what pyGPOAbuse / SharpGPOAbuse need for -gpo-id. This is NOT the node objectid:
+    BloodHound keys GPOs by their objectGUID, a different value. We pull it from the
+    gpcpath / gPCFileSysPath property. Returned without braces (the form the tools expect)."""
+    import re
+    path = str(n.p("gpcpath") or n.p("gpcfilesyspath") or "")
+    m = re.search(r"\{?([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+                  r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\}?\s*$", path)
+    return m.group(1) if m else None
+
+
 # --------------------------------------------------------------------------- #
 # interactive node-info overlay — a drillable tree, Esc closes, never changes start
 # --------------------------------------------------------------------------- #
@@ -6759,6 +6818,14 @@ class NodeInfoView(AttackTreeBase):
             return
         facts = root.add(Text("key facts", style="bold"), expand=True)
         facts.add_leaf(Text(f"SID: {sid}", style="grey70")).allow_expand = False   # certipy -sid, etc.
+        if n.kind == "GPO":
+            gpo_guid = bh._gpo_sysvol_guid(n)
+            if gpo_guid:
+                facts.add_leaf(Text(f"SYSVOL GUID (pyGPOAbuse -gpo-id): {gpo_guid}",
+                                    style="bold cyan")).allow_expand = False
+            else:
+                facts.add_leaf(Text("SYSVOL GUID: gpcpath not collected — get the GPO's cn "
+                                    "via LDAP for -gpo-id", style="grey50")).allow_expand = False
         # identity — sam, display name, title, email, description (what the account IS)
         for key, lab in (("samaccountname", "sam"), ("displayname", "display name"),
                          ("title", "title"), ("email", "email")):
@@ -7028,7 +7095,6 @@ class HomeScreen(Screen):
         Binding("escape", "back", "Back"),
         Binding("backspace", "back", "Back"),     # same as Esc — one consistent "go back"
         Binding("i", "info", "Node info"),
-        Binding("ctrl+s", "set_start", "Set as start"),
         Binding("ctrl+o", "owned", "Mark owned"),
         Binding("ctrl+t", "target", "Mark target"),
         Binding("t", "goto('targets')", "Targets"),
@@ -7222,11 +7288,6 @@ class HomeScreen(Screen):
         self.app.exit()
 
     # ---- builders --------------------------------------------------------
-    def _build_start_picker(self):
-        sids = [s for s, n in self.g.nodes.items() if n.kind in ("User", "Computer")]
-        self._mount_aux(PrincipalTable(self.g, sids, "Set start node — users + computers",
-                                       self.app.prof, show_kind=True))
-
     def _build_list(self, title, sids):
         self._mount_aux(PrincipalTable(self.g, list(sids), title, self.app.prof, show_kind=True))
 
@@ -7291,28 +7352,13 @@ class HomeScreen(Screen):
             return
         self._go(lambda: self._mount_aux(NodeInfoView(sid)))
 
-    def action_set_start(self):
-        """Set the highlighted node (in any view) as the start node and show its tree.
-        In a principal list Ctrl+S cycles sort instead (handled by the list itself)."""
-        sid = self._active_sid()
-        if sid:
-            self.app.open_start(sid)
-
     def action_owned(self):
-        before = set(self.app.owned)
         if self._tree_live():
             self._view.act_owned()
         elif isinstance(self._aux, PrincipalTable):
             self._aux.mark_owned()
         elif isinstance(self._aux, AttackTreeBase):        # node info / escalation / rights …
             self._aux.toggle_owned_cursor()
-        # the first foothold you own becomes the start when none is set yet — loaded
-        # quietly into the tree so the current view (e.g. the Users list) stays put
-        added = self.app.owned - before
-        if not self.app.start and len(added) == 1:
-            sid = next(iter(added))
-            self.app.start = sid
-            self._view.load(sid)
         self._refresh()
 
     def action_target(self):
@@ -7361,13 +7407,9 @@ class HomeScreen(Screen):
             self.open_start(mid)            # foothold's privesc row) → open that node's tree
             return
         if mid in ("start", "start_tree", "start_path", "owned_view"):
-            # overview position rows: show the start's (or an owned node's) attack tree,
-            # which carries the shortest-path chain + owned set; otherwise go pick one.
-            tgt = self.app.start or next(iter(self.app.owned), None)
-            if tgt:
-                self.open_start(tgt)
-            else:
-                self.dispatch("users")
+            # overview rows → show the attack-tree view (OWNED SET and the routes below)
+            self._view.show_empty()
+            self.show_view()
         elif mid == "targets":
             sids = [s for s, n in g.nodes.items() if n.kind in TARGET_KINDS]
             self._go(lambda: self._mount_aux(PrincipalTable(
@@ -7388,9 +7430,9 @@ class HomeScreen(Screen):
         elif mid == "tree":
             if self.app.start:
                 self._view.load(self.app.start, push=False)   # rebuild: owned set may have changed
-                self.show_view()
             else:
-                self.dispatch("users")
+                self._view.show_empty()                       # OWNED SET (or the ^o hint)
+            self.show_view()
         elif mid == "rights":
             self._go(self._build_rights)
         elif mid == "maq":
