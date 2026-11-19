@@ -7,10 +7,10 @@ piecing together Active Directory privilege-escalation paths that the BloodHound
 GUI doesn't surface on its own.
 
 Run it with just `-d <data>` to drop into the interactive app (pick a start node,
-browse the attack tree, escalation routes, rights, etc.). If the optional
-`textual` + `rich` packages are installed you get the full-screen TUI; otherwise
-it falls back to a stdlib curses menu. The subcommands below always work for
-one-off / scripted use with zero third-party packages.
+browse the attack tree, escalation routes, rights, etc.). The app is a full-screen
+TUI and needs the `textual` + `rich` packages; without them bernese prints how to
+install them and exits. The subcommands below always work for one-off / scripted
+use with zero third-party packages.
 
     summary                            domain overview
     users / groups / computers         inventory with the interesting flags
@@ -24,8 +24,8 @@ one-off / scripted use with zero third-party packages.
     paths --from X [--to Y]            attack paths (to a target, or any high-value)
     escalate --from X                  everything reachable from X
 
-Python 3.8+. The CLI + curses menu are stdlib-only; the full TUI additionally
-needs `pip install textual rich`.
+Python 3.8+. The CLI subcommands are stdlib-only; the TUI additionally needs
+`pip install textual rich`.
 """
 
 import argparse
@@ -34,11 +34,12 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import zipfile
 from collections import defaultdict, deque
 
-__version__ = "1.2"
+__version__ = "1.3"
 
 # --------------------------------------------------------------------------- #
 # Colour
@@ -59,15 +60,6 @@ def bold(s):   return C.w(s, "1")
 def dim(s):    return C.w(s, "2")
 
 # --- consistent key-chip + navigation-bar styling, used for every prompt ---- #
-def _kc(key):
-    """A highlighted key 'chip': bold black on bright-cyan background."""
-    return C.w(f" {key} ", "1;30;106")
-
-def _navbar(pairs, lead="\n  "):
-    """Render a consistent legend/prompt bar from (key, label) pairs — chips in
-    colour, labels in bold, never dim. Returns a string ready to pass to input()."""
-    return lead + "   ".join(_kc(k) + " " + bold(lbl) for k, lbl in pairs) + bold(cyan("   › "))
-
 def _optref(n):
     """A loud pointer to a menu option, so cross-references don't vanish in dim text."""
     return C.w(f" ▶ option {n} ", "1;30;106")
@@ -134,6 +126,10 @@ CONTROL_RIGHTS = {
 REPL_RIGHTS = {"GetChanges", "GetChangesAll", "GetChangesInFilteredSet", "DCSync"}
 # template ESCs where simply enrolling gets you a cert you can auth with as a DA
 ENROLL_ESCS = ("ESC1", "ESC2", "ESC3", "ESC9", "ESC15")
+# ESCs that let the enroller get a certificate as an arbitrary user (SAN / enrollment agent /
+# template rewrite) → edges straight to the admin accounts. ESC9 needs write on a victim's UPN
+# first, ESC8 / ESC13 grant something else, so they stay domain / group edges only.
+IMPERSONATE_ESCS = ("ESC1", "ESC2", "ESC3", "ESC4", "ESC15")
 
 def technique(right, target_kind, target_name):
     k = (target_kind or "").lower()
@@ -254,6 +250,10 @@ class Graph:
         self.trusts = []                       # dicts from _mk_trust
         self.oid_group = {}                    # issuance-policy OID -> linked group SID (ESC13)
         self.forest_root = None                # forest-root domain SID (ForestRootIdentifier)
+        self.sources = []                      # basename(s) of the collection(s) loaded
+        self.collectors = set()                # meta.collectorversion strings seen
+        self.unmodeled = defaultdict(int)      # ACE right name -> count (not turned into edges)
+        self.dq = {}                           # data_quality() result
 
     def node(self, sid):
         n = self.nodes.get(sid)
@@ -346,6 +346,8 @@ class Graph:
                     self.add_edge(psid, sid, right)
                 elif right in REPL_RIGHTS:
                     repl_by[psid].add(right)
+                else:
+                    self.unmodeled[right] += 1
             if n.kind == "Domain":
                 for psid, rights in repl_by.items():
                     if ("GetChanges" in rights and "GetChangesAll" in rights) or "DCSync" in rights:
@@ -518,8 +520,12 @@ def _iter_json(path):
     elif path.lower().endswith(".json"):
         with open(path, "rb") as f:
             yield os.path.basename(path), _loads_bytes(f.read())
+    elif not os.path.exists(path):
+        raise SystemExit(red(f"[!] No such file or directory: {path}  "
+                             f"(cwd: {os.getcwd()})"))
     else:
-        raise SystemExit(red(f"[!] Don't know how to read: {path}"))
+        raise SystemExit(red(f"[!] Don't know how to read: {path}  "
+                             "(expected a .zip, a .json, or a directory of .json files)"))
 
 def _kind_from(meta_type, filename):
     if meta_type and meta_type in FILE_KIND:
@@ -752,6 +758,20 @@ def _user_profile(g, sid):
         b = min(hv, key=lambda s: reach[s][0])
         best = (g.is_highvalue(b), reach[b][0], reach[b][1])
     return size, hv, best
+
+def _control_counts(g, sid):
+    """(groups, rights, targets, reach): groups the principal is in (transitively), the
+    control edges it holds directly or through those groups, how many distinct objects
+    those cover, and everything reachable by chaining memberships and control edges."""
+    closure = _principal_closure(g, sid)
+    groups = sum(1 for c in closure if c != sid)
+    rights, targets = 0, set()
+    for c in closure:
+        for (dst, lbl) in g.ctrl.get(c, []):
+            if lbl != "MemberOf":
+                rights += 1
+                targets.add(dst)
+    return groups, rights, len(targets), len(g.reachable(sid)) - 1
 
 def _group_names(g, sid, limit=3):
     """Readable names of the non-default groups a user belongs to."""
@@ -1038,13 +1058,6 @@ def _user_owned_computers(g):
                 out.append((src, sid))
     return out
 
-# interesting, non-default, non-blank user property fields worth showing
-_USER_FIELDS = [
-    ("description", "desc"), ("title", "title"), ("email", "email"),
-    ("displayname", "display"), ("pwdlastset", "pwdset"),
-    ("lastlogontimestamp", "lastlogon"), ("useraccountcontrol", "uac"),
-]
-
 def _user_detail_lines(g, n):
     """Non-blank, interesting fields for a user, as 'key = value' strings."""
     out = []
@@ -1080,6 +1093,20 @@ def analyze_adcs(g):
             for m in _expand_members(g, psid):
                 out.add(m)
         return out
+
+    # A SAN / enrollment-agent abuse lets the enroller request a certificate AS any user —
+    # so besides "→ domain" it gets a direct edge to each admin account it can become.
+    admins = {}
+
+    def impersonate(abuser, domain, code):
+        if code not in IMPERSONATE_ESCS:
+            return
+        if domain not in admins:
+            admins[domain] = [sid for (_n, sid, _u, _l) in _impersonation_targets(g)
+                              if str(sid).startswith(str(domain) + "-")]
+        for victim in admins[domain]:
+            if victim != abuser:
+                g.add_edge(abuser, victim, code)
 
     for ca in g.cas:
         ca["domain"] = _obj_domain(g, ca["props"])
@@ -1133,6 +1160,7 @@ def analyze_adcs(g):
                 if en and en.kind in ("User", "Computer"):
                     g.add_edge(e, domain, code)
                     g.esc_branches.append((code, e, t["name"]))
+                    impersonate(e, domain, code)
         for grp in t["esc13_groups"]:
             for e in enrollers:
                 en = g.nodes.get(e)
@@ -1144,6 +1172,7 @@ def analyze_adcs(g):
                 if en and en.kind in ("User", "Computer"):
                     g.add_edge(e, domain, "ESC4")
                     g.esc_branches.append(("ESC4", e, t["name"]))
+                    impersonate(e, domain, "ESC4")
 
     for ca in g.cas:
         abusers = set()
@@ -1247,11 +1276,96 @@ def _json_member_names(path):
             return [n for n in z.namelist() if _is_json_member(n)]
     return [os.path.basename(path)]
 
+def state_path(g):
+    """Per-domain file holding the operator's owned / start / targets between runs."""
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    # keyed on the primary (first-loaded) domain only, so adding a second -d that brings
+    # in another domain doesn't orphan the saved state
+    key = (g.domain_sids[0] if g.domain_sids else None) or g.domain_name or "unknown"
+    key = re.sub(r"[^A-Za-z0-9._-]", "_", key)[:120]
+    return os.path.join(base, "bernese", key + ".json")
+
+def load_state(g):
+    try:
+        with open(state_path(g)) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(st, dict):
+        return None
+    keep = lambda xs: [s for s in (xs or []) if s in g.nodes]
+    start = st.get("start") if st.get("start") in g.nodes else None
+    paths = [tuple(pr) for pr in (st.get("paths") or [])
+             if isinstance(pr, list) and len(pr) == 2 and all(x in g.nodes for x in pr)]
+    return {"owned": keep(st.get("owned")), "targets": keep(st.get("targets")), "start": start,
+            "paths": paths}
+
+def save_state(g, owned, targets, start, paths=()):
+    p = state_path(g)
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"domain": g.domain_name, "owned": sorted(owned),
+                       "targets": sorted(targets), "start": start,
+                       "paths": [list(pr) for pr in paths]}, f, indent=1)
+        os.replace(tmp, p)
+        return True
+    except OSError:
+        return False
+
+def clear_state(g):
+    try:
+        os.remove(state_path(g))
+        return True
+    except OSError:
+        return False
+
+LAPS_READ_EDGES = {"ReadLAPSPassword", "SyncLAPSPassword", "GenericAll", "AllExtendedRights"}
+
+def data_quality(g):
+    """Collection-completeness signals: which collector produced the data, ACE rights
+    that weren't turned into edges, and edge types the data implies but never contains."""
+    labels = defaultdict(int)
+    for lst in g.ctrl.values():
+        for (_d, lbl) in lst:
+            labels[lbl] += 1
+    comps = [n for n in g.nodes.values() if n.kind == "Computer"]
+    laps = [n.sid for n in comps if n.p("haslaps")]
+    laps_norecv = [s for s in laps
+                   if not any(l in LAPS_READ_EDGES for (_s, l) in g.rctrl.get(s, []))]
+    users = sum(1 for n in g.nodes.values() if n.kind == "User")
+    notes = []
+    if laps and not labels.get("ReadLAPSPassword") and not labels.get("SyncLAPSPassword"):
+        notes.append(f"{len(laps)} computer(s) have LAPS but the data has no ReadLAPSPassword "
+                     "edges at all — the collector likely didn't emit them")
+    if users >= 5 and not labels.get("WriteAccountRestrictions"):
+        why = ("RustHound-CE 2.5.x doesn't emit this right"
+               if any("rusthound" in c.lower() for c in g.collectors)
+               else "the collector may not emit this right")
+        notes.append(f"no WriteAccountRestrictions edges — {why} (it can still exist in AD)")
+    if g.unmodeled:
+        top = ", ".join(f"{k} ×{v}" for k, v in sorted(g.unmodeled.items(),
+                                                     key=lambda kv: -kv[1])[:6])
+        notes.append(f"ACE rights present but not modelled as edges: {top}")
+    if not g.collectors:
+        notes.append("no meta.collectorversion in the data (collector unknown)")
+    if len(g.sources) > 1:
+        notes.append(f"merged {len(g.sources)} collections: " + ", ".join(g.sources))
+    return {"collectors": sorted(g.collectors), "laps": laps, "laps_noreader": laps_norecv,
+            "notes": notes, "edge_counts": dict(labels)}
+
 def load(path):
+    # Accept one source or several (merge). Collecting one box at a time is the norm when
+    # SharpHound can't run everywhere, so -d can take multiple zips/dirs and they fold into
+    # one graph: nodes merge by SID, ACEs / members are de-duplicated before edge-building.
+    paths = [path] if isinstance(path, str) else list(path)
     g = Graph()
-    total = len(_json_member_names(path)) or 1
+    g.sources = [os.path.basename(p) for p in paths]
+    total = sum(len(_json_member_names(p)) for p in paths) or 1
     seen_files = 0
-    for fname, blob in _iter_json(path):
+    for p in paths:
+      for fname, blob in _iter_json(p):
         seen_files += 1
         _progress(f"loading [{seen_files}/{total}] {os.path.basename(fname)} …")
         if not isinstance(blob, dict):
@@ -1259,6 +1373,9 @@ def load(path):
         meta = blob.get("meta", {}) or {}
         data = blob.get("data", []) or []
         kind = _kind_from(meta.get("type"), fname)
+        cv = meta.get("collectorversion") or meta.get("collector")
+        if cv:
+            g.collectors.add(str(cv))
         for obj in data:
             if not isinstance(obj, dict):
                 continue
@@ -1285,7 +1402,13 @@ def load(path):
             if n.kind == "Base":
                 n.kind = kind
             props = _get(obj, "Properties", default={}) or {}
-            n.props = {str(k).lower(): v for k, v in props.items()}
+            newprops = {str(k).lower(): v for k, v in props.items()}
+            if n.props:                              # merge collections: keep earlier values
+                for k, v in newprops.items():        # unless this source has a non-empty one
+                    if v not in (None, "", [], {}) or k not in n.props:
+                        n.props[k] = v
+            else:
+                n.props = newprops
             n.name = n.p("name") or n.p("distinguishedname") or sid
             for key in ("name", "samaccountname", "distinguishedname"):
                 v = n.p(key)
@@ -1387,6 +1510,36 @@ def load(path):
             if "@" in nm:
                 g.domain_name = nm.split("@", 1)[1]
                 break
+    # merging several collections can repeat the same object's ACEs / members / etc.;
+    # de-duplicate (order-preserving) so edges aren't double-counted.
+    if len(g.sources) > 1:
+        for n in g.nodes.values():
+            if n.aces:
+                n.aces = list(dict.fromkeys(n.aces))
+            for attr in ("members", "allowed_to_act", "allowed_to_delegate",
+                         "spntargets", "sessions"):
+                v = getattr(n, attr)
+                if v:
+                    setattr(n, attr, list(dict.fromkeys(v)))
+        g.sidhistory = list(dict.fromkeys(g.sidhistory))
+        g.local_rights = list(dict.fromkeys(g.local_rights))
+        g.domain_sids = list(dict.fromkeys(g.domain_sids))
+        seen_t = set()
+        g.trusts = [t for t in g.trusts
+                    if not ((t["src"], t["dst"]) in seen_t or seen_t.add((t["src"], t["dst"])))]
+        def _adcs_key(o):                   # GUID is often blank: fall back to name+domain
+            p = o["props"]
+            return o.get("guid") or p.get("objectguid") or (
+                str(o["name"]).upper(), str(p.get("domainsid") or p.get("domain") or "").upper())
+        seen_tp = set()
+        g.templates = [t for t in g.templates
+                       if not (_adcs_key(t) in seen_tp or seen_tp.add(_adcs_key(t)))]
+        seen_ca = set()
+        g.cas = [c for c in g.cas
+                 if not (_adcs_key(c) in seen_ca or seen_ca.add(_adcs_key(c)))]
+        for d in (g.container_children, g.container_links):
+            for k, v in d.items():
+                d[k] = list(dict.fromkeys(v))
     # fold primary-group membership into the group's member list
     for sid, n in list(g.nodes.items()):
         if n.primary_group:
@@ -1399,6 +1552,7 @@ def load(path):
     analyze_adcs(g)
     _progress("resolving GPO links …")
     build_gpo_abuse(g)
+    g.dq = data_quality(g)
     _progress(f"loaded {len(g.nodes)} nodes, "
               f"{sum(len(v) for v in g.ctrl.values())} edges.", done=True)
     return g
@@ -1438,6 +1592,11 @@ def cmd_summary(g, args):
     header(f"Domain: {g.domain_name or '?'}")
     print(f"  {kinds.get('User',0)} users   {kinds.get('Group',0)} groups   "
           f"{kinds.get('Computer',0)} computers   {dim(str(edges) + ' control edges')}")
+    dq = g.dq or {}
+    if dq.get("collectors"):
+        print(dim("  collector: " + ", ".join(dq["collectors"])))
+    for note in dq.get("notes", []):
+        print(yellow("  [data] ") + note)
 
     def bullet(label, items, empty_ok=True, count=None):
         """Print a finding section; items is a list of pre-formatted strings.
@@ -2457,14 +2616,6 @@ def _tech_short(right, kind):
         return "write -> takeover"
     return m.get(right, "")
 
-_GLYPH = {"User": ("U", green), "Group": ("G", yellow), "Computer": ("C", blue),
-          "Domain": ("D", mag), "GPO": ("P", cyan)}
-
-def _glyph(g, sid):
-    n = g.nodes.get(sid)
-    sym, col = _GLYPH.get(n.kind if n else "", ("?", lambda s: s))
-    return col(f"[{sym}]")
-
 # ACL takeover rights that should visually jump out in a tree
 _DANGER = {"ForceChangePassword", "GenericAll", "GenericWrite", "WriteDacl",
            "WriteOwner", "Owns", "Owner", "AddKeyCredentialLink", "AllExtendedRights",
@@ -2481,367 +2632,6 @@ def _edge_render(lbl):
     if lbl in _DANGER:
         return bold(mag(lbl))
     return yellow(lbl)
-
-def _node_tags(g, sid, owned=None):
-    tags = []
-    if owned and sid in owned:
-        tags.append(bold(green("✓ OWNED")))
-    hv = g.is_highvalue(sid)
-    if hv:
-        tags.append(red(f"★ {hv}"))
-    n = g.nodes.get(sid)
-    if n:
-        is_kerb = (n.kind == "User"
-                   and (n.p("hasspn") or n.p("serviceprincipalnames"))
-                   and sid.rsplit("-", 1)[-1] != "502")
-        if is_kerb:
-            enc = _A_plain(_roast_enc_tag(n)[0])
-            if hv or sid in _priv_set(g):
-                tags.append(bold(red(f"⚠ ROASTABLE ADMIN ({enc})")))
-            else:
-                tags.append(bold(red(f"⚑ Kerberoastable ({enc})")))
-        if n.p("dontreqpreauth"):
-            tags.append(bold(red("⚑ AS-REP")))
-        d = n.p("description")
-        if d:
-            tags.append(dim(f'"{str(d)[:50]}"'))
-    return "  " + "  ".join(tags) if tags else ""
-
-def _build_tree(g, starts, max_depth=12, max_nodes=600, fanout=12):
-    """BFS spanning tree from one sid or a set of sids (multi-source).
-
-    When a single node has more than `fanout` outbound edges of the SAME label
-    (e.g. one group that can ReadLAPSPassword on 1000 computers), those targets
-    are recorded as a compressed BUNDLE instead of being expanded as individual
-    nodes — so they don't blow the node cap and every such group still shows."""
-    if isinstance(starts, str):
-        starts = [starts]
-    seen = set(starts)
-    children = defaultdict(list)
-    bundles = defaultdict(list)              # parent sid -> [(label, [target sids])]
-    depth = {s: 0 for s in starts}
-    q = deque(starts)
-    truncated = False
-    while q:
-        cur = q.popleft()
-        if depth[cur] >= max_depth:
-            continue
-        bylabel = defaultdict(list)
-        for (nxt, lbl) in g.ctrl.get(cur, []):
-            bylabel[lbl].append(nxt)
-        stop = False
-        for lbl, targets in bylabel.items():
-            if lbl != "MemberOf" and len(targets) > fanout:
-                bundles[cur].append((lbl, targets))     # compress — don't expand/recurse
-                continue
-            for nxt in targets:
-                if nxt in seen:
-                    continue
-                if len(seen) >= max_nodes:
-                    truncated = True
-                    stop = True
-                    break
-                seen.add(nxt)
-                depth[nxt] = depth[cur] + 1
-                children[cur].append((nxt, lbl))
-                q.append(nxt)
-            if stop:
-                break
-        if stop:
-            break
-    return children, bundles, truncated, seen
-
-def _foothold_note(g, sid):
-    n = g.nodes.get(sid)
-    notes = []
-    if n and (n.p("hasspn") or n.p("serviceprincipalnames")) and sid.rsplit("-", 1)[-1] != "502":
-        notes.append("Kerberoastable (SPN set) — roast the TGS offline")
-    if n and n.p("dontreqpreauth"):
-        notes.append("AS-REP roastable (no pre-auth)")
-    return notes
-
-def _render_tree(g, roots, owned=None, title="Attack tree", expand_bundles=False):
-    owned = owned or set()
-    header(title)
-    children, bundles, truncated, seen = _build_tree(g, list(roots))
-    reached_hv = []
-    had_bundle = [False]
-    priv = _priv_set(g)
-
-    def _bundle_line(prefix, conn, lbl, targets):
-        """One compressed line for a big same-label fan-out (e.g. LAPS on 1000 hosts)."""
-        had_bundle[0] = True
-        hv_t = [t for t in targets if g.is_highvalue(t)]
-        for t in hv_t:
-            reached_hv.append(t)
-        kind = (g.nodes[targets[0]].kind if g.nodes.get(targets[0]) else "object")
-        plural = {"Computer": "computers", "User": "users", "Group": "groups"}.get(kind, "objects")
-        tech = _tech_short(lbl, kind)
-        names = sorted((g.nodes[t].name.split("@")[0] for t in targets if g.nodes.get(t)), key=str.lower)
-        print(f"  {prefix}{dim(conn)} {_edge_render(lbl)} "
-              + bold(f"{len(targets)} {plural}") + (f"   {dim('· ' + tech)}" if tech else ""))
-        sub = prefix + "    "
-        if kind == "Computer":
-            # which of these hosts are actually worth it: a DC, or a privileged
-            # user exposes creds there (session / local admin)
-            juicy = [(t, _computer_value(g, t, priv)[1]) for t in targets]
-            juicy = [(t, tg) for t, tg in juicy if tg]
-            if juicy:
-                print(f"  {sub}{bold(red('★ ' + str(len(juicy)) + ' worth popping here '))}"
-                      + dim("(read LAPS / local admin → steal those creds):"))
-                for t, tags in sorted(juicy, key=lambda e: (not _is_dc(g, e[0]), g.nodes[e[0]].name))[:8]:
-                    print(f"  {sub}  {blue(g.nodes[t].name.split('@')[0])}  {red('· ' + ' · '.join(tags))}")
-                if len(juicy) > 8:
-                    print(f"  {sub}  {dim('… +' + str(len(juicy) - 8) + ' more — press x to list all')}")
-        elif hv_t:
-            hv_names = sorted({g.nodes[t].name.split('@')[0] for t in hv_t}, key=str.lower)
-            shown = ", ".join(hv_names[:10]) + (f" … +{len(hv_names) - 10}" if len(hv_names) > 10 else "")
-            print(f"  {sub}{bold(red('★ ' + str(len(hv_t)) + ' high-value here: '))}{bold(red(shown))}")
-        if expand_bundles:
-            for nm in names:
-                print(f"  {sub}{dim(nm)}")
-        else:
-            sample = ", ".join(names[:6]) + (f" … +{len(names) - 6} more" if len(names) > 6 else "")
-            print(f"  {sub}{dim(sample)}")
-            if len(names) > 6:
-                print(f"  {sub}{dim('(press x to list all, or inspect the group with i)')}")
-
-    def rec(sid, prefix):
-        kids = children.get(sid, [])
-        bnd = bundles.get(sid, [])
-        total = len(kids) + len(bnd)
-        for i, (c, lbl) in enumerate(kids):
-            last = (i == total - 1)
-            conn = "└──" if last else "├──"
-            cn = g.nodes.get(c)
-            note = _tech_short(lbl, cn.kind if cn else "")
-            note_s = f"   {dim('· ' + note)}" if note else ""
-            name = g.nodes[c].name.split("@")[0] if cn else c
-            hv = g.is_highvalue(c)
-            goal = bold(red("   ⟹ FULL DOMAIN COMPROMISE")) if (cn and cn.kind == "Domain") else ""
-            is_priv = bool(hv) or c in priv
-            namecol = f"{_glyph(g, c)} " + (bold(red(name)) if is_priv else name)
-            print(f"  {prefix}{dim(conn)} {_edge_render(lbl)} {namecol}"
-                  f"{_node_tags(g, c, owned)}{note_s}{goal}")
-            if hv:
-                reached_hv.append(c)
-            rec(c, prefix + ("    " if last else dim("│") + "   "))
-        for j, (lbl, targets) in enumerate(bnd):
-            last = (len(kids) + j == total - 1)
-            _bundle_line(prefix, "└──" if last else "├──", lbl, targets)
-
-    roots = list(roots)
-    for root in roots:
-        rn = g.nodes.get(root)
-        if not rn:
-            continue
-        print(f"\n  {_glyph(g, root)} {bold(green(rn.name.split('@')[0]))}{_node_tags(g, root, owned)}")
-        for note in _foothold_note(g, root):
-            print(dim(f"      ↳ potential foothold: {note}"))
-        adminto = [d for (d, l) in g.ctrl.get(root, []) if l == "AdminTo"]
-        if adminto:
-            print(bold(red("      ↳ local admin on: "))
-                  + red(", ".join(sorted(g.nodes[d].name.split("@")[0] for d in adminto if g.nodes.get(d)))))
-        if not children.get(root) and not bundles.get(root):
-            print(dim("      (no outbound control — can't take over anything via ACLs here)"))
-        rec(root, "")
-
-    if truncated:
-        print(dim("\n  … tree truncated at the node cap; narrow the start node(s)."))
-    if reached_hv:
-        print(bold(green("\n  ⇒ Reaches high-value: "
-                         + ", ".join(sorted({g.nodes[s].name.split('@')[0] for s in reached_hv})))))
-    else:
-        print(bold(yellow("\n  ⚑ No high-value target reached by ACL from here.")))
-
-    # Anything a plain domain user can do regardless of ACLs (privileged ones flagged)
-    priv = _priv_set(g)
-    rootset = set(roots)
-
-    def _roast_name(s):
-        nm = g.nodes[s].name.split("@")[0]
-        return bold(red(nm + " ⚠")) if (s in priv or g.is_highvalue(s)) else green(nm)
-
-    roast = [s for s in g.nodes if g.nodes[s].kind == "User"
-             and (g.nodes[s].p("hasspn") or g.nodes[s].p("serviceprincipalnames"))
-             and s.rsplit("-", 1)[-1] != "502" and s not in rootset]
-    asrep = [s for s in g.nodes if g.nodes[s].kind == "User" and g.nodes[s].p("dontreqpreauth")]
-    roast.sort(key=lambda s: (s not in priv, g.nodes[s].name))
-    asrep.sort(key=lambda s: (s not in priv, g.nodes[s].name))
-    if roast or asrep:
-        print(bold(cyan("\n  Reachable by any domain user (no ACL needed):")))
-        if roast:
-            print(f"    Kerberoast:  {', '.join(_roast_name(s) for s in roast)}  {dim('(⚠ = privileged)')}")
-        if asrep:
-            print(f"    AS-REP:      {', '.join(_roast_name(s) for s in asrep)}")
-
-    _print_esc_branches(g, exclude_reachable=seen)
-
-    if had_bundle[0] and not expand_bundles and sys.stdin.isatty():
-        try:
-            ans = input(_navbar([("x", "list every target in the compressed rows"),
-                                 ("Enter", "continue")])).strip().lower()
-        except EOFError:
-            ans = ""
-        if ans == "x":
-            _render_tree(g, roots, owned, title, expand_bundles=True)
-            return reached_hv
-    return reached_hv
-
-def print_attack_tree(g, start, owned=None, expand_bundles=False):
-    sn = g.nodes.get(start)
-    if not sn:
-        print(red("  unknown node"))
-        return
-    _render_tree(g, [start], owned, f"Attack tree — what you can do as {sn.name.split('@')[0]}",
-                 expand_bundles=expand_bundles)
-
-def print_combined_tree(g, owned):
-    """Multi-source tree from every owned node, plus chains between owned nodes."""
-    roots = sorted(owned, key=lambda s: g.nodes[s].name if s in g.nodes else s)
-    names = ", ".join(g.nodes[s].name.split("@")[0] for s in roots if s in g.nodes)
-    _render_tree(g, roots, set(owned), f"Combined attack surface — OWNED: {names}")
-    # chains between owned principals
-    chains = []
-    for a in roots:
-        reach = g.reachable(a)
-        for b in roots:
-            if b != a and b in reach:
-                chains.append((a, b, reach[b][0], reach[b][1]))
-    if chains:
-        print(bold(cyan("\n  Chains between owned principals:")))
-        for a, b, hops, lbl in chains:
-            print(f"    {green(g.nodes[a].name.split('@')[0])} {dim('──' + str(hops) + 'h▶')} "
-                  f"{green(g.nodes[b].name.split('@')[0])}  {dim('(leverage one to pivot to the other)')}")
-
-def print_escalation_overview(g, owned=None, expand=False, allow_prompt=True):
-    """High-level routes to high-value. Condensed by default; [x] expands the
-    long lists. Credential wins (roast-a-DA / DCSync / LAPS / ESC) are called out
-    separately from ACL chains because on an engagement those are usually the path."""
-    owned = owned or set()
-    header("Escalation overview — routes to a high-value target")
-    da_set = _da_member_set(g)
-
-    # --- compute ACL routes from each launch point (owned, else non-admin users)
-    launch = [s for s in owned] if owned else [
-        n.sid for n in g.nodes.values() if n.kind == "User" and not _is_admin(g, n.sid)]
-    routes = []                                  # (src, hv_sid, hops, via)
-    for s in launch:
-        if s not in g.nodes:
-            continue
-        reach = g.reachable(s)
-        hits = [h for h in reach if h != s and g.is_highvalue(h)]
-        if hits:
-            b = min(hits, key=lambda h: reach[h][0])
-            routes.append((s, b, reach[b][0], reach[b][1]))
-    routes.sort(key=lambda r: (r[2], g.nodes[r[0]].name))
-
-    scope = "from OWNED" if owned else "from any non-admin account"
-    if routes:
-        src, b, hops, _ = routes[0]
-        path = g.bfs_path(src, b)
-        chain = "  →  ".join((g.nodes[x].name.split("@")[0] if g.nodes.get(x) else x)
-                             for x, _ in (path or []))
-        print(bold(yellow(f"  ★ FASTEST ACL WIN ({scope}, {hops} hop(s)):")))
-        print(f"     {green(g.nodes[src].name.split('@')[0])}  ⇒  {red(g.is_highvalue(b))}")
-        print(dim(f"     {chain}\n"))
-
-    # --- credential wins (no ACL chain needed) --------------------------------
-    print(bold("  ● Credential wins (out-of-band — usually the real path):"))
-    any_cred = False
-    priv_roast = [n for n in g.nodes.values() if n.kind == "User"
-                  and (n.p("hasspn") or n.p("serviceprincipalnames"))
-                  and n.sid.rsplit("-", 1)[-1] != "502"
-                  and (n.sid in da_set or g.is_highvalue(n.sid) or n.p("admincount"))]
-    for n in priv_roast:
-        any_cred = True
-        print(f"     {bold(red('⚠ ROAST'))} {green(n.name.split('@')[0])} {_roast_enc_tag(n)[0]}"
-              f"{_priv_roast_tag(g, n.sid, da_set)}  {_optref(7)}")
-    dcs = sorted({(g.nodes[s].name.split('@')[0] if s in g.nodes else (_sid_hint(s) or s))
-                  for d in g.domain_sids for (s, l) in g.rctrl.get(d, [])
-                  if (l == "DCSync" or l in REPL_RIGHTS) and not _is_default_dcsync(g, s)})
-    if dcs:
-        any_cred = True
-        print(f"     {bold(red('⚠ DCSync'))} {green(', '.join(dcs))} "
-              f"{dim('→ dump every hash in the domain')}  {_optref(12)}")
-    laps = defaultdict(set)
-    for r, c in _laps_readers(g):
-        laps[r].add(c)
-    # which LAPS readers does your OWNED set actually hold (member of that group)?
-    own_closure = set()
-    for o in owned:
-        own_closure |= _principal_closure(g, o)
-    # yours first, then by how many hosts
-    laps_sorted = sorted(laps.items(), key=lambda kv: (kv[0] not in own_closure, -len(kv[1])))
-    for r, cs in (laps_sorted if expand else laps_sorted[:6]):
-        any_cred = True
-        yours = bold(green("  ✓ YOU HOLD THIS")) if r in own_closure else ""
-        print(f"     {bold(red('⚠ LAPS'))} {green(g.nodes[r].name.split('@')[0])} "
-              f"{dim('→ local admin on ' + str(len(cs)) + ' host(s)')}  {_optref(17)}{yours}")
-    if not expand and len(laps_sorted) > 6:
-        print(dim(f"     … +{len(laps_sorted) - 6} more LAPS readers (expand)"))
-    if owned and laps and not any(r in own_closure for r in laps):
-        print(dim("     (none of the LAPS readers above are groups your owned set is in)"))
-    if not any_cred:
-        print(dim("     (none)"))
-
-    _print_esc_branches(g)                        # ADCS ESC branches
-
-    # --- ACL paths, bucketed by distance --------------------------------------
-    quick = [r for r in routes if r[2] <= 2]
-    med = [r for r in routes if 3 <= r[2] <= 5]
-    far = [r for r in routes if r[2] > 5]
-
-    def line(r):
-        src, b, hops, via = r
-        return (f"       {green(g.nodes[src].name.split('@')[0])} "
-                f"{dim('— ' + str(hops) + 'h via ' + str(via) + ' ▶ ')}{red(g.is_highvalue(b))}")
-
-    print(bold(f"\n  ● ACL control paths to high-value  ({len(routes)} start point(s)):"))
-    if quick:
-        print(dim(f"     quick (≤2 hops) — {len(quick)}:"))
-        for r in (quick if expand else quick[:15]):
-            print(line(r))
-        if not expand and len(quick) > 15:
-            print(dim(f"       … +{len(quick) - 15} more (expand)"))
-    if med:
-        print(dim(f"     medium (3–5 hops) — {len(med)}:"))
-        for r in (med if expand else med[:5]):
-            print(line(r))
-        if not expand and len(med) > 5:
-            print(dim(f"       … +{len(med) - 5} more (expand)"))
-    if far:
-        print(dim(f"     long (>5 hops) — {len(far)}" + ("" if expand else "  (expand to list)")))
-        if expand:
-            for r in far:
-                print(line(r))
-    if not routes:
-        print(dim("     (none reach high-value by ACL alone — use the credential wins above)"))
-
-    # --- footholds (counts, not a wall of names) ------------------------------
-    kerb = [n for n in g.nodes.values() if n.kind == "User"
-            and (n.p("hasspn") or n.p("serviceprincipalnames")) and n.sid.rsplit("-", 1)[-1] != "502"]
-    asrep = [n for n in g.nodes.values() if n.kind == "User" and n.p("dontreqpreauth")]
-    rc4 = sum(1 for n in kerb if "RC4" in _enc_types(n))
-    aes = sum(1 for n in kerb if _enc_types(n) and "RC4" not in _enc_types(n))
-    unk = len(kerb) - rc4 - aes
-    print(bold("\n  ● Footholds any domain user can grab:"))
-    print(f"     kerberoastable: {bold(str(len(kerb)))}  "
-          f"{dim('(' + str(rc4) + ' RC4, ' + str(aes) + ' AES-only, ' + str(unk) + ' enc-unset)')}  {_optref(7)}")
-    print(f"     AS-REP roastable: {bold(str(len(asrep)))}  {_optref(8)}")
-
-    truncated = (not expand) and (len(quick) > 15 or len(med) > 5 or bool(far)
-                                  or len(laps_sorted) > 6)
-    if allow_prompt and truncated and sys.stdin.isatty():
-        try:
-            ans = input(_navbar([("x", "expand full detail"), ("b", "back")])).strip().lower()
-        except EOFError:
-            ans = ""
-        if ans == "x":
-            print_escalation_overview(g, owned, expand=True, allow_prompt=False)
-            return
-    print("\n  " + dim("Tip: set a listed account as start") + " " + _kc("s")
-          + " " + dim("then view its attack tree") + " " + _kc("2"))
 
 # --------------------------------------------------------------------------- #
 # Node detail / fastest win / export
@@ -2881,27 +2671,6 @@ def _ts_parse(v):
         pass
     return -1, "-"
 
-_JUICY_RIGHTS = ("DCSync", "GenericAll", "GenericWrite", "WriteDacl", "WriteOwner",
-                 "Owns", "ForceChangePassword", "AddKeyCredentialLink", "AddMember",
-                 "AdminTo", "AllowedToAct", "ReadLAPSPassword", "ReadGMSAPassword",
-                 "GPOAbuse", "WriteSPN", "AllExtendedRights")
-
-def _group_priv_summary(g, gsid):
-    """Short note on what belonging to this group grants (notable rights / HV)."""
-    if g.is_highvalue(gsid):
-        return red(f"★ {g.is_highvalue(gsid)}")
-    cnt = defaultdict(int)
-    for (_dst, l) in g.ctrl.get(gsid, []):
-        if l != "MemberOf":
-            cnt[l] += 1
-    bits = [f"{k}×{cnt[k]}" for k in _JUICY_RIGHTS if cnt.get(k)]
-    if bits:
-        return red("grants " + ", ".join(bits[:4]))
-    _, _, best = _user_profile(g, gsid)
-    if best:
-        return red(f"→ reaches ★ {best[0]} in {best[1]}h")
-    return ""
-
 def _user_machine_accounts(g, sid):
     """Computer objects this user owns (Owns/Owner/WriteOwner) — i.e. likely MAQ-created."""
     out = []
@@ -2912,209 +2681,6 @@ def _user_machine_accounts(g, sid):
                for (src, l) in g.rctrl.get(c, [])):
             out.append(c)
     return out
-
-def print_node_detail(g, sid, full=False):
-    n = g.nodes.get(sid)
-    if not n:
-        print(red("  unknown node"))
-        return
-    cap = None if full else 20
-    truncated = False
-    header(f"{n.name}   [{n.kind}]")
-    hv = g.is_highvalue(sid)
-    if hv:
-        print(red(f"  ★ HIGH-VALUE: {hv}"))
-    fl = flags_for(g, n)
-    if fl:
-        print("  " + fl)
-    print(bold("\n  Properties:"))
-    for key, lab in _DETAIL_FIELDS:
-        v = n.p(key)
-        if v not in (None, "", [], False) or (key == "enabled" and v is False):
-            if isinstance(v, list):
-                v = ", ".join(str(x) for x in v)
-            elif key in ("pwdlastset", "lastlogontimestamp", "whencreated"):
-                v = _fmt_ts(v)
-            print(f"    {dim(lab + ':'):<28} {v}")
-    # SPNs are only actionable on USER accounts (kerberoastable). A computer's host
-    # SPNs are noise — its password is machine-managed and uncrackable — so skip them.
-    spns = n.p("serviceprincipalnames")
-    if spns and n.kind == "User":
-        print(f"    {dim('SPNs:')}")
-        for s in (spns if isinstance(spns, list) else [spns]):
-            print(f"        {s}")
-
-    # Roast / privilege callout (actionable, up top)
-    notes = []
-    if n.kind == "User" and (n.p("hasspn") or n.p("serviceprincipalnames")) and sid.rsplit("-", 1)[-1] != "502":
-        enc, hint = _roast_enc_tag(n)
-        adm = " " + red("ROASTABLE ADMIN ⚠") if (hv or sid in _priv_set(g)) else ""
-        notes.append(f"Kerberoastable ({_A_plain(enc)}){adm} — {hint}")
-    if n.p("dontreqpreauth"):
-        notes.append("AS-REP roastable — hashcat -m 18200")
-    if sid in _priv_set(g) and not hv:
-        notes.append("member of a privileged group (effectively admin)")
-    for nt in notes:
-        print(red(f"  ⚠ {nt}"))
-
-    # Member of — direct AND nested, high-value groups flagged (like the tree)
-    closure = _principal_closure(g, sid)
-    direct = set(_direct_groups(g, sid))
-    grp_sids = [d for d in closure
-                if d != sid and g.nodes.get(d) and g.nodes[d].kind == "Group"]
-    grp_sids.sort(key=lambda s: (not bool(g.is_highvalue(s)), g.nodes[s].name))
-    if grp_sids:
-        print(bold(f"\n  Member of ({len(grp_sids)} incl. nested) — what each grants you:"))
-        for d in (grp_sids if full else grp_sids[:cap]):
-            nm = g.nodes[d].name.split("@")[0]
-            hvg = g.is_highvalue(d)
-            name = bold(red(nm)) if hvg else nm
-            via = "" if d in direct else dim(" (nested)")
-            summ = _group_priv_summary(g, d)
-            print(f"    {name}{via}" + (f"   {summ}" if summ else ""))
-        if not full and len(grp_sids) > cap:
-            truncated = True
-            print(dim(f"    … +{len(grp_sids) - cap} more  (press x to expand)"))
-
-    # Where this leads — nearest high-value + overall reach
-    size, hvreach, best = _user_profile(g, sid)
-    print(bold("\n  Where this leads:"))
-    if hv:
-        print(red(f"    this node IS high-value: {hv}"))
-    elif best:
-        print(red(f"    shortest path to ★ {best[0]}  ({best[1]} step{'s' if best[1] != 1 else ''}):"))
-        reach = g.reachable(sid)
-        hvs = [s for s in reach if s != sid and g.is_highvalue(s)]
-        target = min(hvs, key=lambda s: reach[s][0]) if hvs else None
-        path = g.bfs_path(sid, target) if target else None
-        for i, (psid, lbl) in enumerate(path or []):
-            nm = g.nodes[psid].name.split("@")[0] if psid in g.nodes else (_sid_hint(psid) or psid)
-            if i == 0:
-                print(f"      {dim('you are here:')} {green(nm)}")
-            else:
-                star = red(" ★") if g.is_highvalue(psid) else ""
-                print(f"      {dim(str(i) + '.')} {yellow(lbl)} -> {nm}{star}")
-    if size:
-        kinds = defaultdict(int)
-        for s in g.reachable(sid):
-            if s != sid and g.nodes.get(s):
-                kinds[g.nodes[s].kind] += 1
-        brk = ", ".join(f"{kinds[k]} {k.lower()}(s)" for k in ("User", "Computer", "Group") if kinds[k])
-        print(f"    can ultimately control {bold(str(size))} node(s)" + (dim("  (" + brk + ")") if brk else ""))
-    elif not hv and not best:
-        print(dim("    controls nothing further via ACLs"))
-
-    outbound = g.ctrl.get(sid, [])
-    acl_out = [(d, l) for (d, l) in outbound if l != "MemberOf"]
-    if acl_out:
-        print(bold(f"\n  Controls ({len(acl_out)}):"))
-        rows = sorted(acl_out, key=lambda e: g.nodes.get(e[0], Node(e[0])).name)
-        for dst, lbl in (rows if full else rows[:cap]):
-            print(f"    {_edge_render(lbl)}  {dim('->')}  {g.label(dst)}")
-        if not full and len(acl_out) > cap:
-            truncated = True
-            print(dim(f"    … +{len(acl_out) - cap} more  (press x to expand)"))
-
-    if n.kind == "Group":
-        priv = _priv_set(g)
-        mem = [m for m in _expand_members(g, sid)
-               if g.nodes.get(m) and g.nodes[m].kind in ("User", "Computer")]
-        mem.sort(key=lambda s: (s not in priv and not g.is_highvalue(s), g.nodes[s].name))
-        print(bold(f"\n  Members ({len(mem)}):"))
-        if not mem:
-            print(dim("    (no user/computer members — may contain only nested groups)"))
-        for m in (mem if full else mem[:cap]):
-            mn = g.nodes[m]
-            is_priv = m in priv or g.is_highvalue(m)
-            kerb = (mn.kind == "User" and (mn.p("hasspn") or mn.p("serviceprincipalnames"))
-                    and m.rsplit("-", 1)[-1] != "502")
-            tags = (red(" ⚠ privileged") if is_priv else "") + (red(" [roastable]") if kerb else "")
-            print(f"    {g.label(m)}{tags}")
-        if not full and len(mem) > cap:
-            truncated = True
-            print(dim(f"    … +{len(mem) - cap} more  (press x to expand)"))
-
-    if n.kind == "User":
-        adminon = sorted({d for (d, l) in g.ctrl.get(sid, [])
-                          if l == "AdminTo" and g.nodes.get(d) and g.nodes[d].kind == "Computer"},
-                         key=lambda s: g.nodes[s].name)
-        sess_on = sorted((c for c, cn in g.nodes.items()
-                          if cn.kind == "Computer" and sid in cn.sessions),
-                         key=lambda s: g.nodes[s].name)
-        if adminon or sess_on:
-            print(bold("\n  Machines this user is tied to:"))
-            for items, lab, col in ((adminon, "local admin on", red),
-                                    (sess_on, "has a session on", yellow)):
-                if not items:
-                    continue
-                shown = ", ".join(g.nodes[c].name.split("@")[0]
-                                  for c in (items if full else items[:cap]))
-                tail = "" if (full or len(items) <= cap) else dim(f"  … +{len(items) - cap} more")
-                if not full and len(items) > cap:
-                    truncated = True
-                print(f"    {col(lab)} ({len(items)}): {blue(shown)}{tail}")
-            print(dim("    (local admin → dump creds there; a live session → steal that token / TGT)"))
-
-    if n.kind == "User":
-        macs = _user_machine_accounts(g, sid)
-        if g.maq is not None or macs:
-            print(bold("\n  Machine accounts / MAQ:"))
-            if g.maq is not None:
-                mq = red(str(g.maq)) if isinstance(g.maq, int) and g.maq > 0 else str(g.maq)
-                print(f"    domain MachineAccountQuota = {mq}")
-            if macs:
-                print("    owns/created: "
-                      + blue(", ".join(sorted(g.nodes[c].name.split('@')[0] for c in macs)))
-                      + dim("  (owner of a computer = full control → RBCD / Shadow Creds)"))
-            else:
-                print(dim("    this user owns no computer objects in the data"))
-
-    if n.kind == "GPO":
-        comps = g.gpo_affects.get(sid, set())
-        print(bold(f"\n  Linked to / affects ({len(comps)} computer(s)):"))
-        if comps:
-            print("    " + ", ".join(sorted(g.nodes[c].name.split("@")[0] for c in comps)))
-            print(dim("    (control of this GPO = code execution as SYSTEM on all of the above)"))
-        else:
-            print(dim("    (not linked to any computers)"))
-
-    if n.kind == "Computer" and n.sessions:
-        print(bold("\n  Sessions (logged-on users):"))
-        for u in (n.sessions if full else n.sessions[:cap]):
-            print(f"    {g.label(u)}")
-        if not full and len(n.sessions) > cap:
-            truncated = True
-            print(dim(f"    … +{len(n.sessions) - cap} more  (press x to expand)"))
-    adminto = [a for (a, l) in g.rctrl.get(sid, []) if l == "AdminTo"]
-    if n.kind == "Computer" and adminto:
-        print(bold("\n  Local admins:"))
-        for a in (adminto if full else adminto[:cap]):
-            print(f"    {g.label(a)}")
-        if not full and len(adminto) > cap:
-            truncated = True
-            print(dim(f"    … +{len(adminto) - cap} more  (press x to expand)"))
-
-    if truncated and sys.stdin.isatty():
-        # biggest list on this node is what a filter actually helps with
-        if n.kind == "Group":
-            findable = [m for m in _expand_members(g, sid)
-                        if g.nodes.get(m) and g.nodes[m].kind in ("User", "Computer")]
-            findlabel = "Members of " + n.name.split("@")[0]
-        else:
-            findable = [d for (d, l) in g.ctrl.get(sid, []) if l != "MemberOf"]
-            findlabel = n.name.split("@")[0] + " controls"
-        pairs = [("x", "expand all lists")]
-        if len(findable) > 20:
-            pairs.insert(0, ("f", "find / filter the long list"))
-        pairs.append(("b", "back"))
-        try:
-            ans = input(_navbar(pairs)).strip().lower()
-        except EOFError:
-            ans = ""
-        if ans == "x":
-            print_node_detail(g, sid, full=True)
-        elif ans == "f" and len(findable) > 20:
-            _browse_nodes(g, findlabel, findable)
 
 def _fastest_win(g, owned=None):
     """Shortest known route to a high-value target. Prefer owned principals as
@@ -3135,103 +2701,6 @@ def _fastest_win(g, owned=None):
         return None
     return g.bfs_path(best[0], best[1])
 
-def _capture(fn, *a):
-    """Run a print-producing function with colour off, return the plain text."""
-    old = C.enabled
-    C.enabled = False
-    buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            fn(*a)
-    finally:
-        C.enabled = old
-    return buf.getvalue()
-
-def _names_only(g, kind, predicate=None):
-    """Print bare object names (samaccountname-ish), one per line, no other data."""
-    names = sorted({(g.nodes[s].name.split("@")[0])
-                    for s, n in g.nodes.items()
-                    if n.kind == kind and (predicate is None or predicate(n))},
-                   key=str.lower)
-    for nm in names:
-        print(nm)
-
-def export_flow(g, start, owned):
-    dom = (g.domain_name or "domain").lower()
-    _kerb = lambda n: (n.p("hasspn") or n.p("serviceprincipalnames")) and n.sid.rsplit("-", 1)[-1] != "502"
-    da_set = _da_member_set(g)
-    items = [
-        ("1", "users", "Domain users (full detail)", lambda: cmd_users(g, _A())),
-        ("2", "domain-admins", "Domain admins & high-value groups", lambda: cmd_das(g, _A())),
-        ("3", "kerberoastable", "Kerberoastable accounts", lambda: cmd_kerberoastable(g, _A())),
-        ("4", "asreproastable", "AS-REP roastable accounts", lambda: cmd_asreproastable(g, _A())),
-        ("5", "computers", "Computers (full detail)", lambda: cmd_computers(g, _A())),
-        ("6", "groups", "Groups", lambda: cmd_groups(g, _A())),
-        ("7", "spns", "SPN / service accounts", lambda: cmd_spns(g, _A())),
-        ("8", "dcsync", "DCSync principals", lambda: cmd_dcsync(g, _A())),
-        ("9", "adcs", "ADCS / ESC", lambda: cmd_adcs(g, _A())),
-        ("10", "delegation", "Delegation", lambda: cmd_delegation(g, _A())),
-        ("14", "domain-controllers", "Domain controllers", lambda: cmd_dcs(g, _A())),
-        ("15", "maq", "MachineAccountQuota & user-owned machines", lambda: cmd_maq(g, _A())),
-        ("16", "password-policy", "Domain password policy", lambda: cmd_pwpolicy(g, _A())),
-        ("11", "summary", "Domain summary", lambda: cmd_summary(g, _A())),
-        ("12", "escalation", "Escalation overview", lambda: print_escalation_overview(g, owned, expand=True, allow_prompt=False)),
-        ("13", "everything", "EVERYTHING (summary + findings)", None),
-        # --- names only (bare list, one per line, no other data) ---
-        ("n1", "names-users", "NAMES ONLY: usernames", lambda: _names_only(g, "User")),
-        ("n2", "names-computers", "NAMES ONLY: computer names", lambda: _names_only(g, "Computer")),
-        ("n3", "names-groups", "NAMES ONLY: group names", lambda: _names_only(g, "Group")),
-        ("n4", "names-kerberoastable", "NAMES ONLY: kerberoastable users", lambda: _names_only(g, "User", _kerb)),
-        ("n5", "names-da", "NAMES ONLY: domain admins", lambda: _names_only(g, "User", lambda n: n.sid in da_set)),
-        ("n6", "names-enabled-users", "NAMES ONLY: enabled users", lambda: _names_only(g, "User", lambda n: n.p("enabled") is not False)),
-    ]
-    if start:
-        items.insert(11, ("t", "attack-tree",
-                          f"Attack tree from {g.nodes[start].name.split('@')[0]}",
-                          lambda: print_attack_tree(g, start, owned, expand_bundles=True)))
-    header("Export to text file — pick what to save")
-    for key, _slug, label, _fn in items:
-        if key == "n1":
-            print(dim("   ── names-only lists (bare, one per line — feed to a tool) ──"))
-        print(f"   {bold(key.rjust(2))})  {label}")
-    try:
-        tok = input(_navbar([("#", "export"), ("b", "back")])).strip().lower()
-    except EOFError:
-        return
-    if not tok or tok in ("b", "q"):
-        return
-    chosen = next((it for it in items if it[0] == tok), None)
-    if not chosen:
-        print(red("  unknown choice"))
-        return
-    _, slug, label, fn = chosen
-    if slug == "everything":
-        parts = [("Summary", lambda: cmd_summary(g, _A())),
-                 ("Domain admins", lambda: cmd_das(g, _A())),
-                 ("Kerberoastable", lambda: cmd_kerberoastable(g, _A())),
-                 ("AS-REP roastable", lambda: cmd_asreproastable(g, _A())),
-                 ("SPN / services", lambda: cmd_spns(g, _A())),
-                 ("DCSync", lambda: cmd_dcsync(g, _A())),
-                 ("Delegation", lambda: cmd_delegation(g, _A())),
-                 ("ADCS / ESC", lambda: cmd_adcs(g, _A())),
-                 ("Escalation overview", lambda: print_escalation_overview(g, owned, expand=True, allow_prompt=False))]
-        text = "".join(f"\n{'='*70}\n{t}\n{'='*70}\n" + _capture(f) for t, f in parts)
-    else:
-        text = _capture(fn)
-    default = f"bernese_{dom}_{slug}.txt"
-    try:
-        fname = input(cyan(f"  filename [{default}]: ")).strip() or default
-    except EOFError:
-        return
-    try:
-        with open(fname, "w") as fh:
-            if not slug.startswith("names-"):     # names-only files stay a clean wordlist
-                fh.write(f"# bernese export — {label} — domain {g.domain_name or '?'}\n")
-            fh.write(text)
-        print(bold(green(f"  wrote {os.path.abspath(fname)}")))
-    except OSError as e:
-        print(red(f"  could not write file: {e}"))
-
 # --------------------------------------------------------------------------- #
 # Interactive mode
 # --------------------------------------------------------------------------- #
@@ -3239,1043 +2708,38 @@ class _A:
     def __init__(self, **kw):
         self.__dict__.update(kw)
 
-def _ljust(plain, width, colored=None):
-    """Left-justify by the PLAIN text width, then apply colour to the content."""
-    pad = " " * max(0, width - len(plain))
-    return (colored if colored is not None else plain) + pad
-
-def _curses_pick(title, header_line, rows, owned=None, detail=None, toggle=True):
-    """Arrow-key / type-to-filter picker. rows = [(key, plain_text, da, _)].
-    Enter selects; when `owned` is given its members render with a green ✓ and,
-    if `toggle` is set, Tab adds/removes the highlighted row (used by the start
-    picker). With `toggle` False the ✓ is a read-only marker (e.g. rights you
-    already hold). `detail`, if given, is a callback key -> plain string shown as
-    a live info strip for whatever row is highlighted.
-    Returns ('ok', key|None) on success, or ('__NOCURSES__', None) to fall back."""
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        return ("__NOCURSES__", None)
-    try:
-        import curses
-    except Exception:
-        return ("__NOCURSES__", None)
-    # Drop anything typed ahead (e.g. the Enter that submitted the previous
-    # input() prompt) so it isn't read as a stray Enter/Esc here.
-    try:
-        import termios
-        termios.tcflush(sys.stdin, termios.TCIFLUSH)
-    except Exception:
-        pass
-    out = {"key": None}
-
-    def run(stdscr):
-        curses.curs_set(0)
-        curses.flushinp()
-        has_color = False
-        try:
-            curses.start_color(); curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_RED, -1)
-            curses.init_pair(2, curses.COLOR_GREEN, -1)
-            curses.init_pair(3, curses.COLOR_CYAN, -1)
-            curses.init_pair(4, curses.COLOR_YELLOW, -1)
-            has_color = True
-        except Exception:
-            pass
-        sel, top, filt = 0, 0, ""
-        while True:
-            view = [r for r in rows if filt.lower() in r[1].lower()] if filt else rows
-            sel = max(0, min(sel, len(view) - 1))
-            h, w = stdscr.getmaxyx()
-            stdscr.erase()
-            stdscr.addnstr(0, 0, title[:w - 1], w - 1,
-                           curses.A_BOLD | (curses.color_pair(3) if has_color else 0))
-            own_hint = "  Tab own/unown " if (owned is not None and toggle) else " "
-            hint = f" ↑↓ move  Enter select {own_hint} Esc back  —  type to filter: {filt}_"
-            # reverse-video bar so it reads as a clear control strip, not faint text
-            hint_attr = curses.A_REVERSE | curses.A_BOLD
-            if has_color:
-                hint_attr |= curses.color_pair(3)
-            stdscr.addnstr(1, 0, hint.ljust(w - 1)[:w - 1], w - 1, hint_attr)
-            if header_line:
-                stdscr.addnstr(2, 0, header_line[:w - 1], w - 1, curses.A_BOLD)
-            listtop = 3 if header_line else 2
-            # last row is the count; when a detail callback is given, the row
-            # above it carries the live info strip for the highlighted item
-            vis = max(1, h - listtop - 1 - (1 if detail else 0))
-            if sel < top:
-                top = sel
-            if sel >= top + vis:
-                top = sel - vis + 1
-            for i in range(top, min(len(view), top + vis)):
-                r = view[i]; y = listtop + (i - top)
-                is_owned = owned is not None and r[0] in owned
-                attr = 0
-                if has_color:
-                    if is_owned:
-                        attr |= curses.color_pair(2) | curses.A_BOLD
-                    elif r[2]:
-                        attr |= curses.color_pair(1) | curses.A_BOLD
-                if i == sel:
-                    attr |= curses.A_REVERSE
-                prefix = ("✔" if is_owned else " ") + ("›" if i == sel else " ")
-                stdscr.addnstr(y, 0, prefix + " " + r[1], w - 1, attr)
-            if detail:
-                try:
-                    info = detail(view[sel][0]) if view else ""
-                except Exception:
-                    info = ""
-                info_attr = curses.A_BOLD | (curses.color_pair(4) if has_color else 0)
-                stdscr.addnstr(h - 2, 0, ("  " + (info or "")).ljust(w - 1)[:w - 1],
-                               w - 1, info_attr)
-            stdscr.addnstr(h - 1, 0, f"  {len(view)}/{len(rows)} shown", w - 1, curses.A_DIM)
-            stdscr.refresh()
-            c = stdscr.getch()
-            if c == curses.KEY_UP:
-                sel -= 1
-            elif c == curses.KEY_DOWN:
-                sel += 1
-            elif c == curses.KEY_NPAGE:
-                sel += vis
-            elif c == curses.KEY_PPAGE:
-                sel -= vis
-            elif c == curses.KEY_HOME:
-                sel = 0
-            elif c == curses.KEY_END:
-                sel = len(view) - 1
-            elif c in (10, 13, curses.KEY_ENTER):
-                if view:
-                    out["key"] = view[sel][0]
-                return
-            elif c == 27:
-                return
-            elif owned is not None and toggle and c == 9:   # Tab = own/unown (letters filter)
-                if view:
-                    sid = view[sel][0]
-                    owned.discard(sid) if sid in owned else owned.add(sid)
-            elif c in (curses.KEY_BACKSPACE, 127, 8):
-                filt = filt[:-1]
-            elif 32 <= c <= 126:
-                filt += chr(c)
-            sel = max(0, sel)
-    try:
-        curses.wrapper(run)
-    except Exception:
-        return ("__NOCURSES__", None)
-    return ("ok", out["key"])
-
-def _fit(s, w):
-    s = s or ""
-    return s[:w].ljust(w)
-
-def _pick_principals(g, nodes, title, owned=None, sort="interest"):
-    """Shared arrow-key / numbered picker for a set of user/computer nodes."""
-    owned = set() if owned is None else owned      # keep caller's set (even if empty)
-    prof = {}
-    total = len(nodes)
-    for i, n in enumerate(nodes, 1):
-        if total > 200 and (i % 50 == 0 or i == total):
-            _progress(f"profiling {i}/{total} principals for the picker …", done=(i == total))
-        size, hv, best = _user_profile(g, n.sid)
-        prof[n.sid] = (size, hv, best, _group_names(g, n.sid, limit=3))
-
-    def sort_key(n):
-        size, hv, best, grps = prof[n.sid]
-        if sort == "name":
-            return (n.name,)
-        if sort == "group":
-            return ((grps[0] if grps else "~"), n.name)
-        if sort == "tree":
-            return (_is_admin(g, n.sid), -size, n.name)
-        roast = bool(n.p("hasspn") or n.p("serviceprincipalnames"))
-        return (_is_admin(g, n.sid), not bool(hv), -size, not roast, n.name)
-
-    rows = sorted(nodes, key=sort_key)
-
-    def tags(n):
-        t = ""
-        # computers carry host SPNs by default, so [Kerb] only makes sense for users
-        if n.kind == "User" and (n.p("hasspn") or n.p("serviceprincipalnames")) and n.sid.rsplit("-", 1)[-1] != "502":
-            t += " [Kerb]"
-        if n.p("dontreqpreauth"):
-            t += " [ASREP]"
-        if n.kind == "Computer" and _is_dc(g, n.sid):
-            t += " [DC]"
-        return t
-
-    def reach_str(size, best):
-        # one clear column instead of a raw count + a "(Nh via Edge)" blob
-        if best:
-            return f"★ reaches {best[0].split(' ')[0]} ({best[1]}h)"
-        return f"controls {size}" if size else "-"
-
-    hdr = "  " + _fit("NAME", 26) + _fit("GROUPS", 38) + "REACH"
-    crows = []
-    for n in rows:
-        size, hv, best, grps = prof[n.sid]
-        txt = (_fit(n.name.split("@")[0] + tags(n), 26) + _fit(", ".join(grps), 38)
-               + reach_str(size, best))
-        crows.append((n.sid, txt, bool(best), n.sid in owned))
-
-    def detail_line(sid):
-        n = g.nodes.get(sid)
-        if not n:
-            return ""
-        size, hv, best, grps = prof.get(sid, (0, [], None, []))
-        bits = [n.kind]
-        if n.kind == "Computer":
-            if _is_dc(g, sid):
-                bits.append("DOMAIN CONTROLLER")
-            os_ = n.p("operatingsystem")
-            if os_:
-                bits.append(str(os_))
-        if _is_admin(g, sid):
-            bits.append("ADMIN")
-        en = n.p("enabled")
-        if en is not None:
-            bits.append("enabled" if _truthy(en) else "DISABLED")
-        if n.kind == "User" and (n.p("hasspn") or n.p("serviceprincipalnames")) and sid.rsplit("-", 1)[-1] != "502":
-            bits.append("Kerberoastable/" + _A_plain(_roast_enc_tag(n)[0]))
-        if n.p("dontreqpreauth"):
-            bits.append("AS-REP-roastable")
-        if best:
-            bits.append(f"→ {best[0]} in {best[1]}h")
-        elif size:
-            bits.append(f"controls {size} node(s)")
-        else:
-            bits.append("controls nothing further")
-        line = " · ".join(bits)
-        desc = n.p("description")
-        if desc:
-            line += "  —  " + str(desc).replace("\n", " ")
-        return line
-
-    status, key = _curses_pick(title, hdr, crows, owned=owned, detail=detail_line)
-    if status != "__NOCURSES__":
-        return key
-
-    # fallback: numbered list (Enter # to pick; o<#> to toggle owned)
-    header(title)
-    print(dim("   # " + hdr))
-    idx = {}
-    for i, n in enumerate(rows, 1):
-        idx[str(i)] = n.sid
-        size, hv, best, grps = prof[n.sid]
-        own = n.sid in owned
-        mark = bold(green("✔")) if own else " "
-        nm = (bold(green(n.name.split("@")[0])) if own else green(n.name.split("@")[0])) + red(tags(n))
-        print(" " + mark + _ljust(str(i), 3)
-              + _ljust(n.name.split("@")[0] + tags(n), 26, nm)
-              + _ljust((", ".join(grps))[:36], 38, dim((", ".join(grps))[:36]))
-              + (red(reach_str(size, best)) if best else dim(reach_str(size, best))))
-    try:
-        tok = input(_navbar([("#", "pick"), ("o#", "own/unown"),
-                             ("sort", "name|group|tree"), ("b", "back")])).strip()
-    except EOFError:
-        return None
-    if not tok or tok.lower() in ("b", "q"):
-        return None
-    if tok.lower().startswith("sort"):
-        parts = tok.split()
-        ns = parts[1] if len(parts) > 1 and parts[1] in ("name", "group", "tree", "interest") else sort
-        return _pick_principals(g, nodes, title, owned, ns)
-    if tok.lower().startswith("o") and tok[1:].strip().isdigit():   # own/unown row #
-        sid = idx.get(tok[1:].strip())
-        if sid:
-            owned.discard(sid) if sid in owned else owned.add(sid)
-        return _pick_principals(g, nodes, title, owned, sort)
-    return idx.get(tok) or g.resolve(tok)
-
-def browse_users(g, owned=None):
-    users = [n for n in g.nodes.values()
-             if n.kind == "User" and n.sid.startswith("S-1-5-21")
-             and n.sid.rsplit("-", 1)[-1] != "502"]
-    return _pick_principals(g, users, "Users — pick a start node", owned)
-
-def browse_computers(g, owned=None):
-    comps = [n for n in g.nodes.values() if n.kind == "Computer"]
-    if not comps:
-        print(dim("  (no computer objects in this collection)"))
-        return None
-    return _pick_principals(g, comps, "Computers — type to filter, Enter to pick", owned)
-
-def browse_members(g, group_sid, owned=None):
-    """Pick a member (user/computer) of a group to read into it."""
-    members = [g.nodes[m] for m in _expand_members(g, group_sid)
-               if g.nodes.get(m) and g.nodes[m].kind in ("User", "Computer")]
-    if not members:
-        print(dim("  (group has no user/computer members)"))
-        return None
-    gname = g.nodes[group_sid].name.split("@")[0]
-    return _pick_principals(g, members, f"Members of {gname} — pick one to read into", owned)
-
-def browse_groups(g):
-    """Pick one OR MORE groups. Returns a list of group sids (or None).
-    In the arrow-key picker, Tab marks several then Enter confirms; in the
-    numbered fallback, enter comma-separated numbers (e.g. 1,3,5)."""
-    groups = [n for n in g.nodes.values() if n.kind == "Group"]
-
-    def gkey(n):
-        return (not bool(g.is_highvalue(n.sid)), -len(_expand_members(g, n.sid)), n.name)
-
-    rows = sorted(groups, key=gkey)
-
-    def desc(n):
-        d = n.p("description")
-        return str(d).replace("\n", " ") if d else ""
-
-    def preview(n):
-        allm = _expand_members(g, n.sid)
-        names = [g.nodes[m].name.split("@")[0] for m in allm if g.nodes.get(m)
-                 and g.nodes[m].kind in ("User", "Computer")]
-        p = ", ".join(names[:3])
-        if len(names) > 3:
-            p += f", +{len(names) - 3}"
-        return len(allm), p
-
-    hdr = "  " + _fit("GROUP", 30) + _fit("#", 5) + _fit("DESCRIPTION", 40) + "MEMBERS"
-    crows = []
-    for n in rows:
-        cnt, p = preview(n)
-        hv = g.is_highvalue(n.sid)
-        label = n.name.split("@")[0] + (" ★" if hv else "")
-        crows.append((n.sid, _fit(label, 30) + _fit(str(cnt), 5)
-                      + _fit(desc(n), 40) + p, bool(hv), False))
-
-    marked = set()                     # Tab toggles membership; ✓ shows it
-    status, key = _curses_pick("Groups — Tab to mark several, Enter to confirm",
-                               hdr, crows, owned=marked)
-    if status != "__NOCURSES__":
-        if marked:
-            return sorted(marked)
-        return [key] if key else None
-
-    header(f"Groups ({len(rows)})")
-    print(dim("   # " + hdr))
-    idx = {}
-    for i, n in enumerate(rows, 1):
-        idx[str(i)] = n.sid
-        cnt, p = preview(n)
-        hv = g.is_highvalue(n.sid)
-        disp = n.name.split("@")[0][:26] + (" ★" if hv else "")
-        label = red(disp) if hv else yellow(disp)
-        print("  " + _ljust(str(i), 3) + _ljust(disp, 30, label)
-              + _ljust(str(cnt), 5) + _ljust(desc(n)[:38], 40, dim(desc(n)[:38]))
-              + dim(p))
-    try:
-        tok = input(_navbar([("#", "pick"), ("#,#,#", "multi-select"), ("b", "back")])).strip()
-    except EOFError:
-        return None
-    if not tok or tok.lower() in ("b", "q"):
-        return None
-    if "," in tok:
-        sids = [idx.get(t.strip()) for t in tok.split(",")]
-        sids = [s for s in sids if s]
-        return sids or None
-    one = idx.get(tok) or g.resolve(tok)
-    return [one] if one else None
-
-def _browse_nodes(g, title, sids, inspect=True):
-    """Filterable browser over a set of node SIDs — the answer to a 1000-row
-    wall of output. Type to filter, ↑↓ to move, Enter to inspect the highlighted
-    node, Esc to leave. Without curses it falls back to a substring-filter prompt
-    so the search still works. With inspect=False it returns the chosen sid
-    instead of printing its detail."""
-    sids = list(dict.fromkeys(s for s in sids if s))          # de-dupe, keep order
-    if not sids:
-        print(dim("  (nothing to browse)"))
-        return None
-    # value-rank computers: DC / privileged-session hosts float to the top, so
-    # the juicy few in a 1000-row list are the first thing you see / filter.
-    priv = _priv_set(g)
-    cv = {}
-    for s in sids:
-        n = g.nodes.get(s)
-        cv[s] = _computer_value(g, s, priv) if (n and n.kind == "Computer") else (False, [])
-
-    sids.sort(key=lambda s: (not (bool(g.is_highvalue(s)) or cv[s][0]),
-                             (g.nodes[s].name if s in g.nodes else str(s)).lower()))
-
-    def plain(s):
-        n = g.nodes.get(s)
-        base = f"{n.name.split('@')[0]} ({n.kind})" if n else (_sid_hint(s) or str(s))
-        hv = g.is_highvalue(s)
-        if hv:
-            return base + f"  ★ {hv}"
-        return base + ("  ★ high-value" if cv[s][0] else "")
-
-    def detail(s):
-        n = g.nodes.get(s)
-        if not n:
-            return _sid_hint(s) or str(s)
-        size, hv, best = _user_profile(g, s)
-        bits = [n.kind]
-        os_ = n.p("operatingsystem")
-        if os_:
-            bits.append(str(os_))
-        if cv[s][0]:                                          # DC / session / admin tags
-            bits.extend(cv[s][1])
-        if best:
-            bits.append(f"→ {best[0]} in {best[1]}h")
-        elif size:
-            bits.append(f"controls {size} node(s)")
-        d = n.p("description")
-        if d:
-            bits.append(str(d).replace("\n", " "))
-        return " · ".join(bits)
-
-    while True:                                               # curses path
-        crows = [(s, _fit(plain(s), 62), bool(g.is_highvalue(s)), False) for s in sids]
-        status, key = _curses_pick(
-            f"{title} ({len(sids)}) — type to filter · Enter inspect · Esc back",
-            "", crows, detail=detail)
-        if status == "__NOCURSES__":
-            break
-        if key is None:
-            return None
-        if not inspect:
-            return key
-        print_node_detail(g, key)
-
-    # ---- no-curses fallback: substring-filter prompt -----------------------
-    header(f"{title} ({len(sids)})")
-    print(dim("  type a substring to filter · Enter lists all · b to go back"))
-    while True:
-        try:
-            q = input(cyan("  filter › ")).strip()
-        except EOFError:
-            return None
-        if q.lower() in ("b", "q"):
-            return None
-        ql = q.lower()
-        matches = [s for s in sids if ql in plain(s).lower()] if q else sids
-        if not matches:
-            print(dim("    (no matches)"))
-            continue
-        for s in matches[:40]:
-            print("    " + g.label(s))
-        if len(matches) > 40:
-            print(dim(f"    … +{len(matches) - 40} more — narrow the filter"))
-        elif not inspect and len(matches) == 1:
-            return matches[0]
-
-def _prompt_node(g, label="node", owned=None):
-    hint = "name / SID  ·  Enter to browse  ·  b = back"
-    while True:
-        try:
-            tok = input(cyan(f"  {label} ({hint}): ")).strip()
-        except EOFError:
-            return None
-        if tok.lower() in ("b", "q", "back"):
-            return None
-        if not tok:
-            sid = browse_users(g, owned)        # Enter -> browse
-            if sid:
-                return sid
-            continue
-        sid = g.resolve(tok)
-        if sid:
-            return sid
-        print(red("    not found — type part of a name, Enter to browse, or b to go back."))
-
-MENU = [
-    ("1", "Escalation overview (how to reach Domain Admin)"),
-    ("2", "Attack tree from start node  (visual privesc paths)"),
-    ("3", "Shortest path:  start  ->  Domain Admin"),
-    ("4", "Shortest path:  start  ->  a target you pick"),
-    ("5", "Outbound control of start (what it can take over)"),
-    ("6", "Who controls start (inbound)"),
-    ("7", "Kerberoastable accounts"),
-    ("8", "AS-REP roastable accounts"),
-    ("9", "Domain admins & high-value groups"),
-    ("10", "Browse groups  ->  pick a member to read into"),
-    ("11", "Rights search (who holds a right -> drill in)"),
-    ("12", "DCSync-capable principals"),
-    ("13", "Delegation (unconstrained / constrained / RBCD)"),
-    ("14", "ADCS / certificate abuse (ESC)"),
-    ("15", "SPN accounts and what they reach"),
-    ("16", "Local admin rights (who is admin on which hosts)"),
-    ("17", "Domain summary"),
-    ("18", "Domain controllers"),
-    ("19", "MachineAccountQuota & user-owned machines"),
-    ("20", "Domain password policy"),
-]
-
-BANNER = [
-    r" ██████╗ ███████╗██████╗ ███╗   ██╗███████╗███████╗███████╗",
-    r" ██╔══██╗██╔════╝██╔══██╗████╗  ██║██╔════╝██╔════╝██╔════╝",
-    r" ██████╔╝█████╗  ██████╔╝██╔██╗ ██║█████╗  ███████╗█████╗  ",
-    r" ██╔══██╗██╔══╝  ██╔══██╗██║╚██╗██║██╔══╝  ╚════██║██╔══╝  ",
-    r" ██████╔╝███████╗██║  ██║██║ ╚████║███████╗███████║███████╗",
-    r" ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝╚══════╝",
-]
-def _banner(g, data_path):
-    print()
-    for line in BANNER:
-        print(bold(cyan(line)))
-    print(" " + bold(yellow("🐾")) + "  " + bold(cyan("bloodhound attack-path explorer")))
-    print()
-    da = [g.nodes[m].name.split("@")[0] for sid, n in g.nodes.items()
-          if n.kind == "Group" and sid.rsplit("-", 1)[-1] in ("512", "519")
-          for m in _expand_members(g, sid)
-          if g.nodes.get(m) and g.nodes[m].kind == "User"]
-    print(f"  {bold('Domain')} {bold(green(g.domain_name or '?'))}     "
-          f"{bold(str(sum(1 for n in g.nodes.values() if n.kind=='User')))} users   "
-          f"{bold(str(sum(1 for n in g.nodes.values() if n.kind=='Group')))} groups   "
-          f"{bold(str(sum(1 for n in g.nodes.values() if n.kind=='Computer')))} computers   "
-          f"{bold(str(sum(len(v) for v in g.ctrl.values())))} control edges")
-    print(f"  {dim(os.path.basename(data_path))}")
-    if da:
-        print(f"  {dim('Domain Admins:')} {', '.join(sorted(set(da)))}")
-    if isinstance(g.maq, int):
-        if g.maq > 0:
-            print("  " + bold(red(f"MachineAccountQuota: {g.maq}"))
-                  + dim(f" — any user can add up to {g.maq} machine account(s) (RBCD / Shadow-Creds). option 19"))
-        else:
-            print(f"  {dim('MachineAccountQuota: 0 (users cannot add machines)')}")
-
-def _availability(g):
-    return {
-        "7": any(n.kind == "User" and (n.p("hasspn") or n.p("serviceprincipalnames"))
-                 and n.sid.rsplit("-", 1)[-1] != "502" for n in g.nodes.values()),
-        "8": any(n.kind == "User" and n.p("dontreqpreauth") for n in g.nodes.values()),
-        "12": any((lbl == "DCSync" or lbl in REPL_RIGHTS)
-                  for d in g.domain_sids for (_, lbl) in g.rctrl.get(d, [])),
-        "13": any((n.p("unconstraineddelegation") and not _is_default_unconstrained(g, n.sid))
-                  or n.allowed_to_delegate or n.allowed_to_act for n in g.nodes.values()),
-        "14": bool(g.templates or g.cas),
-        "16": any(l == "AdminTo" for d in g.ctrl.values() for (_, l) in d),
-        "18": any(n.kind == "Computer" and _is_dc(g, n.sid) for n in g.nodes.values()),
-        "19": (isinstance(g.maq, int) and g.maq > 0) or bool(_user_owned_computers(g)),
-        "20": _has_pwpolicy(g),
-    }
-
-def _roastable_das(g):
-    """Roastable (kerb/AS-REP) accounts that are themselves Domain/Enterprise Admin."""
-    da_set = _da_member_set(g)
-    out = []
-    for sid in da_set:
-        n = g.nodes.get(sid)
-        if not n or n.kind != "User":
-            continue
-        kerb = (n.p("hasspn") or n.p("serviceprincipalnames")) and sid.rsplit("-", 1)[-1] != "502"
-        if kerb or n.p("dontreqpreauth"):
-            out.append((sid, bool(kerb), bool(n.p("dontreqpreauth"))))
-    return out
-
-def shortest_to_da(g, start):
-    """Shortest ACL path from start to the nearest Domain-Admin-equivalent target."""
-    sn = g.nodes.get(start)
-    header(f"Shortest path: {sn.name.split('@')[0]}  ->  Domain Admin")
-
-    # A roastable DA is effectively a 'path' with no ACL chain — surface it first.
-    rda = _roastable_das(g)
-    if rda:
-        print(bold(red("  ⚠ Roastable Domain Admin — crack this and you ARE DA (no chain needed):")))
-        for sid, kerb, asrep in rda:
-            n = g.nodes[sid]
-            how = []
-            if kerb:
-                how.append(f"Kerberoast {_A_plain(_roast_enc_tag(n)[0])}")
-            if asrep:
-                how.append("AS-REP roast")
-            print(f"     {bold(red('⚠'))} {green(n.name.split('@')[0])}  {dim('(' + ', '.join(how) + ')')}")
-        print()
-
-    reach = g.reachable(start)
-    wins = sorted([s for s in reach if s != start and g.is_highvalue(s)],
-                  key=lambda s: reach[s][0])
-    if not wins:
-        print(bold(yellow("  No ACL path to a high-value / Domain-Admin target from here.")))
-        _print_esc_branches(g, exclude_reachable=set(reach))
-        return
-    best = wins[0]
-    path = g.bfs_path(start, best)
-    _print_path(g, path)
-
-def _reach_note(g, sid):
-    """Short 'where controlling this leads' note: nearest high-value + hops."""
-    if g.is_highvalue(sid):
-        return bold(red(f"  ★ {g.is_highvalue(sid)}"))
-    size, hv, best = _user_profile(g, sid)
-    if best:
-        return red(f"  → reaches ★ {best[0]} in {best[1]} hop(s)")
-    if size:
-        return dim(f"  → controls {size} more node(s), none high-value")
-    return dim("  → dead end (controls nothing further)")
-
-def _print_right_detail(g, psid, r, holders, full, cap=25):
-    """Show what the holder can do with this right over each target, and — more
-    usefully than a member dump — where controlling each target LEADS."""
-    pn = g.nodes.get(psid)
-    header(f"{pn.name.split('@')[0]} ({pn.kind})  —  holds {r}")
-    if pn and pn.kind == "Group":
-        mcnt = sum(1 for mm in _expand_members(g, psid)
-                   if g.nodes.get(mm) and g.nodes[mm].kind in ("User", "Computer"))
-        print(dim(f"  (any of this group's {mcnt} member(s) wields the right below)"))
-
-    tgts = sorted(holders[psid], key=lambda s: (not g.is_highvalue(s),
-                                                g.nodes.get(s, Node(s)).name))
-    truncated = (not full) and len(tgts) > cap
-    shown = tgts if full else tgts[:cap]
-    print(bold(f"\n  Can {r} over {len(tgts)} target(s)  —  what you get & where it leads:"))
-    for t in shown:
-        tn = g.nodes.get(t)
-        print(f"    {red('→')} {g.label(t)}{_reach_note(g, t)}")
-        print(dim(f"        {technique(r, tn.kind if tn else '', tn.name if tn else t)}"))
-        if tn and tn.kind == "Group":
-            # the actionable fact for a group target: joining it inherits ITS access
-            print(dim("        (control of the group = add yourself → inherit the"
-                      " group's memberships & rights above; not the member accounts)"))
-    if truncated:
-        print(dim(f"    … +{len(tgts) - cap} more target(s) — press x"))
-    return truncated
-
-def rights_flow(g, owned=None):
-    """Pick a right -> holders -> drill in. 'b' steps back ONE level; 'm' jumps to
-    the main menu. Rights/holders you hold via your owned set are highlighted; a
-    group target lists the members you'd control (expandable with 'x')."""
-    owned = owned or set()
-    held = _owned_rights(g, owned)
-    own_closure = set()
-    for o in owned:
-        own_closure |= _principal_closure(g, o)
-
-    while True:                                           # level 1: pick a right
-        r = _rights_pick(g, held)
-        if not r:
-            return                                        # b/q here -> main menu
-        holders = defaultdict(list)
-        for sid, n in g.nodes.items():
-            for (psid, right, inh) in n.aces:
-                if right.lower() == r.lower():
-                    holders[psid].append(sid)
-        if not holders:
-            print(dim(f"  (nobody holds {r})"))
-            continue
-
-        while True:                                       # level 2: pick a holder
-            items = sorted(holders.items(),
-                           key=lambda kv: (kv[0] not in own_closure, -len(kv[1]),
-                                           g.nodes.get(kv[0], Node(kv[0])).name))
-
-            def hdetail(psid):
-                n = g.nodes.get(psid)
-                if not n:
-                    return (_sid_hint(psid) or "unresolved SID") + f" · {len(holders[psid])} target(s)"
-                size, hv, best = _user_profile(g, psid)
-                tip = [n.kind, f"{len(holders[psid])} {r} target(s)"]
-                if n.kind == "Group":
-                    mcnt = sum(1 for mm in _expand_members(g, psid)
-                               if g.nodes.get(mm) and g.nodes[mm].kind in ("User", "Computer"))
-                    tip.append(f"group of {mcnt} member(s)")
-                if psid in own_closure:
-                    tip.append("you hold this")
-                if best:
-                    tip.append(f"→ {best[0]} in {best[1]}h")
-                elif size:
-                    tip.append(f"controls {size} node(s)")
-                return " · ".join(tip)
-
-            crows = [(psid, _fit(_A_plain(g.label(psid)), 50) + f"({len(tgts)} target(s))",
-                      False, False) for psid, tgts in items]
-            status, key = _curses_pick(
-                f"Principals holding {r} — ✓ = you hold it · Enter drill in · Esc back to rights",
-                "", crows, owned=own_closure, detail=hdetail, toggle=False)
-            if status != "__NOCURSES__":
-                if key is None:
-                    break                                 # Esc -> back to rights
-                psid = key
-            else:
-                header(f"Principals holding {r}  ({len(items)})")
-                if any(p in own_closure for p, _ in items):
-                    print(bold(green("  ✓ = you hold this via your owned set")))
-                idx = {}
-                for i, (psid, tgts) in enumerate(items, 1):
-                    idx[str(i)] = psid
-                    mine = bold(green(" ✓")) if psid in own_closure else "   "
-                    print(f"  {mine}{bold(str(i).rjust(2))})  {g.label(psid)}  {dim('(' + str(len(tgts)) + ' target(s))')}")
-                try:
-                    tok = input(_navbar([("#", "drill in"), ("b", "back to rights"),
-                                         ("m", "main menu")])).strip().lower()
-                except EOFError:
-                    return
-                if tok == "m":
-                    return                                # jump to main menu
-                if not tok or tok in ("b", "q"):
-                    break                                 # back to level 1
-                psid = idx.get(tok) or g.resolve(tok)
-                if not psid or psid not in holders:
-                    print(red("  unknown choice"))
-                    continue
-
-            full = False
-            while True:                                   # level 3: the detail view
-                truncated = _print_right_detail(g, psid, r, holders, full)
-                pairs = []
-                if len(holders[psid]) > 20:
-                    pairs.append(("f", "find / filter targets"))
-                if truncated:
-                    pairs.append(("x", "show all targets"))
-                pairs += [("b", "back to holders"), ("m", "main menu")]
-                try:
-                    ans = input(_navbar(pairs)).strip().lower()
-                except EOFError:
-                    return
-                if ans == "f" and len(holders[psid]) > 20:
-                    pn = g.nodes.get(psid)
-                    who = pn.name.split("@")[0] if pn else psid
-                    _browse_nodes(g, f"{who} — {r} over", list(holders[psid]))
-                    continue
-                if ans == "x" and truncated:
-                    full = True
-                    continue
-                if ans == "m":
-                    return
-                break                                     # back to level 2 (holders)
-
-def _print_menu(g, start, owned, avail):
-    W = 72                                            # inner width between borders
-
-    def rule(l, r):
-        print(cyan("  " + l + "─" * W + r))
-
-    def row(content=""):
-        vis = len(_A_plain(content))
-        if vis > W - 1:                               # never let a long line break the frame
-            return print(cyan("  │ ") + content)
-        print(cyan("  │ ") + content + " " * (W - 1 - vis) + cyan("│"))
-
-    print()
-    rule("╭", "╮")
-    sname = g.nodes[start].name.split("@")[0] if start else "(none — pick with s / b)"
-    row(bold("START  ") + (bold(green(sname)) if start else dim(sname)))
-    if owned:
-        ownl = ", ".join(sorted(g.nodes[s].name.split("@")[0] for s in owned))
-        if len(ownl) > 52:
-            ownl = ownl[:51] + "…"
-        row(bold("OWNED  ") + bold(green(f"({len(owned)}) ")) + green(ownl))
-    else:
-        row(bold("OWNED  ") + dim("none — highlight a user and press 'o' to mark it"))
-    rule("├", "┤")
-
-    for key, label in MENU:
-        if key in avail and not avail[key]:
-            row(dim(f"{key.rjust(3)})  {label}  — none"))
-        else:
-            row(bold(f"{key.rjust(3)})") + f"  {label}")
-    rule("├", "┤")
-
-    def cell(key, label, w=34):
-        # key chip + label, padded to a fixed visible width so columns line up
-        plain = f"{key}  {label}"
-        return _kc(key) + " " + bold(label) + " " * max(0, w - len(plain) - 1)
-
-    def legend(pairs, per=2):
-        for i in range(0, len(pairs), per):
-            row(" " + "".join(cell(x, y) for x, y in pairs[i:i + per]))
-
-    row(bold(yellow("COMMANDS")))
-    legend([("s", "set start (user)"), ("b", "browse users"),
-            ("comp", "browse computers"), ("o", "own / unown start"),
-            ("c", "combined owned tree"), ("i", "inspect node"),
-            ("e", "export to file"), ("x", "expand a list"),
-            ("q", "quit")])
-    row()
-    row(bold(cyan("IN THE ARROW-KEY PICKER")) + dim("   (set start / browse users)"))
-    legend([("type", "filter as you type"), ("↑↓", "move up / down"),
-            ("Enter", "select"), ("Tab", "own / unown"),
-            ("Esc", "back")])
-    rule("╰", "╯")
-
-def _after_action():
-    """Prompt shown after each action: Enter for menu, or type the next option."""
-    try:
-        nxt = input(_navbar([("Enter", "menu"), ("#", "jump to that option"),
-                             ("q", "quit")])).strip().lower()
-    except EOFError:
-        return "q"
-    return nxt or None
-
-def _rights_pick(g, held=None):
-    held = held or set()
-    holders = defaultdict(set)                 # right -> set of distinct principals
-    for n in g.nodes.values():
-        for (psid, r, _) in n.aces:
-            if r in CONTROL_RIGHTS or r in REPL_RIGHTS:
-                holders[r].add(psid)
-    # rights you hold (via owned) first, then by popularity
-    rights = sorted(holders, key=lambda r: (r not in held, -len(holders[r]), r))
-    if not rights:
-        print(dim("  (no control rights present in this dataset)"))
-        return None
-
-    gloss = {
-        "GenericAll": "full control — reset pw / shadow creds / add to group",
-        "GenericWrite": "write attrs — targeted Kerberoast / shadow creds",
-        "WriteDacl": "rewrite the DACL → grant yourself GenericAll",
-        "WriteOwner": "take ownership → grant yourself GenericAll",
-        "Owns": "owner → rewrite the DACL", "Owner": "owner → rewrite the DACL",
-        "ForceChangePassword": "reset the target's password",
-        "AddMember": "add yourself to the group", "AddSelf": "add yourself to the group",
-        "AddKeyCredentialLink": "shadow credentials → PKINIT as the target",
-        "AllExtendedRights": "all extended rights (ForceChangePassword / DCSync …)",
-        "ReadLAPSPassword": "read the host's local-admin (LAPS) password",
-        "ReadGMSAPassword": "read the gMSA password",
-        "DCSync": "replicate directory secrets — dump every hash",
-        "GetChanges": "half of DCSync (pair with GetChangesAll)",
-        "GetChangesAll": "half of DCSync (pair with GetChanges)",
-    }
-
-    def rdetail(rt):
-        return f"{len(holders[rt])} principal(s) hold {rt} · {gloss.get(rt, 'control right')}"
-
-    crows = [(r, _fit(r, 34) + f"({len(holders[r])} principals)", False, False)
-             for r in rights]
-    status, key = _curses_pick(
-        "Control rights present — ✓ = held via your owned set · Enter pick · Esc back",
-        "", crows, owned=held, detail=rdetail, toggle=False)
-    if status != "__NOCURSES__":
-        return key
-
-    header("Rights present — pick one (count = principals that hold it)")
-    if held:
-        print(bold(green("  ✓ = a right your owned set already holds")))
-    for i, r in enumerate(rights, 1):
-        mine = bold(green(" ✓")) if r in held else "   "
-        name = bold(green(r)) if r in held else r
-        print(f"  {mine}{bold(str(i).rjust(2))})  {name}  {dim('(' + str(len(holders[r])) + ' principals)')}")
-    try:
-        tok = input(_navbar([("#", "pick a right"), ("b", "back")])).strip()
-    except EOFError:
-        return None
-    if not tok or tok.lower() in ("b", "q"):
-        return None
-    if tok.isdigit() and 1 <= int(tok) <= len(rights):
-        return rights[int(tok) - 1]
-    return tok
-
-def _show_tree(g, start, owned):
-    """Attack tree from start; combined (with chains) when 2+ nodes are owned."""
-    if len(owned) >= 2:
-        print_combined_tree(g, owned)
-    elif start:
-        print_attack_tree(g, start, owned)
-
-def _show_start(g, start, owned):
-    """What to show right after a node becomes the start. A computer rarely has
-    outbound control, so its detail (admins, sessions, who controls it) is far
-    more useful than an empty attack tree."""
-    n = g.nodes.get(start) if start else None
-    if n and n.kind == "Computer" and len(owned) < 2:
-        print_node_detail(g, start)
-    else:
-        _show_tree(g, start, owned)
-
-def interactive(g, data_path):
-    owned = set()
-    _banner(g, data_path)
-    avail = _availability(g)
-    print(dim("\n  Pick your start node — type to filter.  (Esc to type a name / SID instead.)"))
-    start = browse_users(g, owned)                       # live type-to-filter picker
-    if start is None:
-        start = _prompt_node(g, "start node", owned=owned)
-    if start:
-        _show_start(g, start, owned)
-
-    pending = None
-    while True:
-        if pending is not None:
-            choice, pending = pending, None
-        else:
-            _print_menu(g, start, owned, avail)
-            try:
-                choice = input(cyan("\n  > ")).strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
-        if not choice:
-            continue
-        if choice in ("q", "quit", "exit"):
-            break
-
-        produced = True
-        try:
-            if choice in ("s", "b"):
-                ns = browse_users(g, owned)              # live picker for both
-                if ns is None and choice == "s":         # Esc -> allow typing a name/SID
-                    ns = _prompt_node(g, "new start node", owned=owned)
-                if ns:
-                    start = ns
-                    _show_start(g, start, owned)
-                else:
-                    produced = False
-            elif choice in ("comp", "computers", "computer"):
-                ns = browse_computers(g, owned)          # Esc -> type a name/SID
-                if ns is None:
-                    ns = _prompt_node(g, "computer (name / SID)", owned=owned)
-                if ns:
-                    start = ns
-                    _show_start(g, start, owned)
-                else:
-                    produced = False
-            elif choice == "o":
-                if not start:
-                    print(red("  Set a start node first."))
-                elif start in owned:
-                    owned.discard(start)
-                    print(dim(f"  unmarked {g.nodes[start].name.split('@')[0]} as owned."))
-                    _show_start(g, start, owned)
-                else:
-                    owned.add(start)
-                    print(bold(green(f"  marked {g.nodes[start].name.split('@')[0]} as OWNED.")))
-                    _show_start(g, start, owned)
-            elif choice == "c":
-                if owned:
-                    print_combined_tree(g, owned)
-                else:
-                    print(dim("  No owned nodes yet — set a start and press 'o' to mark it."))
-            elif choice == "i":
-                tgt = start if start else _prompt_node(g, "node to inspect", owned=owned)
-                if tgt:
-                    print_node_detail(g, tgt)
-                else:
-                    produced = False
-            elif choice == "e":
-                export_flow(g, start, owned)
-            elif choice in ("2", "3", "4", "5", "6") and not start:
-                print(red("  Set a start node first (option s / b)."))
-            elif choice == "1":
-                print_escalation_overview(g, owned)
-            elif choice == "2":
-                _show_tree(g, start, owned)
-            elif choice == "3":
-                shortest_to_da(g, start)
-            elif choice == "4":
-                tgt = _prompt_node(g, "target node", owned=owned)
-                if tgt:
-                    header(f"Path: {g.nodes[start].name.split('@')[0]}  ->  {g.nodes[tgt].name.split('@')[0]}")
-                    path = g.bfs_path(start, tgt)
-                    if path:
-                        _print_path(g, path)
-                    else:
-                        print(bold(yellow("  No ACL path to that target.")))
-                        _print_esc_branches(g)
-                else:
-                    produced = False
-            elif choice == "5":
-                full = False
-                while True:
-                    truncated = cmd_control(g, _A(principal=start), full=full)
-                    if full or not truncated:
-                        break
-                    ans = input(_navbar([("f", "find / filter targets"),
-                                         ("x", "list every controlled object"),
-                                         ("b", "back")])).strip().lower()
-                    if ans == "f":
-                        reach = g.reachable(start)
-                        sids = [s for s in reach if s != start and g.nodes.get(s)]
-                        _browse_nodes(g, f"Controlled by {g.nodes[start].name.split('@')[0]}", sids)
-                        continue
-                    if ans == "x":
-                        full = True
-                        continue
-                    break
-            elif choice == "6":
-                cmd_controllers(g, _A(principal=start))
-            elif choice == "7":
-                cmd_kerberoastable(g, _A())
-            elif choice == "8":
-                cmd_asreproastable(g, _A())
-            elif choice == "9":
-                cmd_das(g, _A())
-            elif choice == "10":
-                grps = browse_groups(g)
-                if grps:
-                    if len(grps) == 1:
-                        print_node_detail(g, grps[0])        # the group's rights + members
-                        m = browse_members(g, grps[0], owned)  # then pick a member to read into
-                    else:
-                        # union of members across the selected groups
-                        seen, members = set(), []
-                        for gs in grps:
-                            for mm in _expand_members(g, gs):
-                                if mm not in seen and g.nodes.get(mm) and g.nodes[mm].kind in ("User", "Computer"):
-                                    seen.add(mm)
-                                    members.append(g.nodes[mm])
-                        gl = ", ".join(g.nodes[s].name.split("@")[0] for s in grps)
-                        print(dim(f"  Combined members of {len(grps)} groups ({gl}): {len(members)}"))
-                        m = _pick_principals(g, members,
-                                             f"Members of {len(grps)} groups — pick one to read into",
-                                             owned) if members else None
-                    if m:
-                        start = m
-                        _show_tree(g, start, owned)
-                    elif len(grps) > 1:
-                        produced = False      # multi-select with no pick -> nothing shown
-                    # single-group: we already printed the group detail, so keep the prompt
-                else:
-                    produced = False
-            elif choice == "11":
-                rights_flow(g, owned)
-                produced = False          # drop straight back to a freshly listed menu
-            elif choice == "12":
-                cmd_dcsync(g, _A())
-            elif choice == "13":
-                cmd_delegation(g, _A())
-            elif choice == "14":
-                cmd_adcs(g, _A())
-            elif choice == "15":
-                cmd_spns(g, _A())
-            elif choice == "16":
-                cmd_adminto(g, _A())
-            elif choice == "17":
-                cmd_summary(g, _A())
-            elif choice == "18":
-                cmd_dcs(g, _A())
-            elif choice == "19":
-                full = False
-                while True:
-                    truncated = cmd_maq(g, _A(), full=full)
-                    if full or not truncated:
-                        break
-                    ans = input(_navbar([("f", "find / filter machines"),
-                                         ("x", "list every machine account"),
-                                         ("b", "back")])).strip().lower()
-                    if ans == "f":
-                        sids = [c for _o, c in _user_owned_computers(g)]
-                        _browse_nodes(g, "User-owned computers", sids)
-                        continue
-                    if ans == "x":
-                        full = True
-                        continue
-                    break
-            elif choice == "20":
-                cmd_pwpolicy(g, _A())
-            else:
-                print(red("  unknown option"))
-                produced = False
-        except SystemExit as e:
-            print(e)
-        if produced:
-            pending = _after_action()
-    print(dim("  bye."))
-
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def _warn_no_tui():
-    """Printed when launched interactively but the full-screen TUI can't run because its
-    optional dependencies are missing — tells the user how to get it."""
-    print(yellow("  [!] Full-screen TUI unavailable — 'textual' and 'rich' are not installed."))
-    print(dim("      Falling back to the basic text menu. To run the full interactive TUI:"))
-    print(bold("          pip install textual rich") + dim("      (or:  pipx install bernese)"))
+    """Printed when bernese is launched without a subcommand but the TUI's dependencies
+    are missing. Says what is wrong and exactly how to fix it."""
+    py = os.path.basename(sys.executable) or "python3"
+    print(red(bold("[!] bernese can't start its interface: 'textual' and 'rich' are not installed.")))
     print()
+    print("    bernese is a full-screen terminal app and needs both packages. Install them")
+    print("    with ONE of these, then run the same command again:")
+    print()
+    here = os.path.dirname(os.path.abspath(__file__))
+    if os.path.exists(os.path.join(here, "pyproject.toml")):
+        print(bold(f"        pipx install {here}") + dim("   # recommended on Kali / Debian"))
+    print(bold(f"        {py} -m pip install textual rich") + dim("   # into the Python you ran this with"))
+    print(bold("        python3 -m venv .venv && .venv/bin/pip install textual rich"))
+    print(dim("                                              # then: .venv/bin/python bernese.py -d <data>"))
+    print()
+    print(dim("    If pip refuses with 'externally-managed-environment', use the pipx or venv line."))
+    print(dim("    The scripted subcommands still work without them:  bernese -d <data> summary"))
 
 def main():
     ap = argparse.ArgumentParser(
         prog="bernese", description="bernese - BloodHound attack-path explorer")
-    ap.add_argument("-d", "--data", required=True,
-                    help="BloodHound CE .zip, a directory of *.json, or a single .json")
+    ap.add_argument("-d", "--data", required=True, action="append", metavar="DATA",
+                    help="BloodHound CE .zip, a directory of *.json, or a single .json. "
+                         "Repeat -d to merge per-box collections into one graph "
+                         "(-d box1.zip -d box2.zip).")
     ap.add_argument("--no-color", action="store_true", help="disable ANSI colour")
+    ap.add_argument("--fresh", action="store_true",
+                    help="TUI: forget saved owned/start/targets for this domain and start clean")
     ap.add_argument("-V", "--version", action="version", version=f"bernese {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=False)
 
@@ -4302,14 +2766,15 @@ def main():
     args = ap.parse_args()
     if getattr(args, "no_color", False):
         C.enabled = False
+    if not args.cmd and not _HAS_TUI:
+        _warn_no_tui()
+        raise SystemExit(2)
     g = load(args.data)
 
     if not args.cmd:
-        if _HAS_TUI:
-            BerneseApp(g).run()          # the interactive Textual TUI
-        else:
-            _warn_no_tui()               # no textual/rich -> note it, then the curses menu
-            interactive(g, args.data)
+        if args.fresh:
+            clear_state(g)
+        BerneseApp(g, restore=not args.fresh).run()    # the interactive Textual TUI
         return
 
     dispatch = {
@@ -4329,9 +2794,9 @@ def main():
 # =========================================================================== #
 # Interactive Textual TUI — the default when you run this file with
 # no subcommand. It needs the third-party `textual` + `rich`; everything above
-# (the CLI subcommands and the stdlib curses menu) runs with ZERO pip installs,
-# so this block is guarded: if those packages are missing the tool still works,
-# it just falls back to the curses menu.
+# (the CLI subcommands) runs with ZERO pip installs, so this block is guarded:
+# if those packages are missing the subcommands still work, and running with no
+# subcommand prints how to install them.
 # =========================================================================== #
 import time
 bh = sys.modules[__name__]            # self-alias so the TUI code's bh.X resolves here
@@ -4341,7 +2806,8 @@ try:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
-    from textual.screen import Screen
+    from rich.cells import cell_len
+    from textual.screen import ModalScreen, Screen
     from textual.widgets import (Button, DataTable, Footer, Header, Input, OptionList,
                                  SelectionList, Static, Tree)
     from textual.widgets.option_list import Option
@@ -4349,7 +2815,7 @@ try:
     _HAS_TUI = True
 except ImportError:                   # textual/rich absent -> stub the names so the class
     _HAS_TUI = False                  # definitions below still import (the TUI won't run;
-    class _StubMeta(type):            # main() checks _HAS_TUI and uses the curses menu).
+    class _StubMeta(type):            # main() checks _HAS_TUI and prints install steps).
         def __getattr__(cls, name):
             return cls
     class _Stub(metaclass=_StubMeta):
@@ -4358,7 +2824,7 @@ except ImportError:                   # textual/rich absent -> stub the names so
         def __getattr__(self, name):
             return None
     ComposeResult = object
-    App = Screen = Vertical = Horizontal = VerticalScroll = _Stub
+    App = Screen = ModalScreen = Vertical = Horizontal = VerticalScroll = _Stub
     Text = DataTable = Footer = Header = Input = OptionList = Static = Tree = Option = _Stub
     Button = SelectionList = Selection = _Stub
     Binding = _Stub
@@ -4380,8 +2846,9 @@ KERB_MARK = "\U0001f39f"               # 🎟 — kerberoastable user (SPN set):
 KERB_STYLE = "purple"                 # plain (non-privileged) kerberoastable users — purple
 PRIV_STYLE = "bold orange1"           # privileged USERS — orange, never green-like-a-user
 PRIV_COMP_STYLE = "bold magenta"      # privileged / high-value COMPUTERS — distinct from users
-ROAST_ADMIN_STYLE = "bold red"        # kerberoastable privileged accounts — crack = instant admin
 OWNED_STYLE = "bold green"            # the owned icon + word
+REACH_MARK = "\U0001f517"              # 🔗 — your owned set has a path to it
+PIN = "\U0001f4cc"                     # 📌 — a path pinned to the attack tree
 TARGET = "\U0001f3af"                  # 🎯 — a node you are going after (^t)
 TARGET_STYLE = "bold yellow"
 TARGET_KINDS = ("User", "Computer", "Group", "GPO", "OU", "Domain", "Container",
@@ -4555,6 +3022,26 @@ def node_tags(g, sid):
     if en is not None and not bh._truthy(en):
         t.append("DISABLED ", style="grey50")
     return t
+
+
+def resolve_all(g, token):
+    """Quiet name resolver for the TUI — returns the list of matching sids (0, 1 or many)
+    without printing, so the caller can show candidates instead of corrupting the screen."""
+    if not token:
+        return []
+    if token in g.nodes:
+        return [token]
+    t = token.upper()
+    if t in g.by_name:
+        return [g.by_name[t]]
+    if g.domain_name and "@" not in t and "." not in t:
+        cand = f"{t}@{g.domain_name.upper()}"
+        if cand in g.by_name:
+            return [g.by_name[cand]]
+    exact = sorted({sid for nm, sid in g.by_name.items() if t == nm.split("@")[0]})
+    if len(exact) == 1:
+        return exact
+    return sorted({sid for nm, sid in g.by_name.items() if t in nm})
 
 
 def _path_text(g, src, dst, priv):
@@ -4806,10 +3293,13 @@ def build_summary(g, sid, priv):
         out.append(f"  shortest path to {STAR} {g.is_highvalue(best_sid)}  "
                    f"({steps} step{'s' if steps != 1 else ''}):\n", style="red")
         out.append(_path_text(g, sid, best_sid, priv))
-    if size:
-        out.append(f"  controls {size} node(s) downstream\n", style="white")
-    elif best_sid is None and not hv:
-        out.append("  controls nothing further\n", style="grey50")
+    _ng, n_rights, n_targets, n_reach = bh._control_counts(g, sid)
+    if n_rights:
+        out.append(f"  holds {n_rights} control right(s) over {n_targets} object(s)\n", style="white")
+    else:
+        out.append("  holds no control rights (direct or via groups)\n", style="grey50")
+    if n_reach:
+        out.append(f"  reach: {n_reach} node(s) by chaining memberships and rights\n", style="grey50")
 
     if n.kind == "Computer":
         ok, tags = bh._computer_value(g, sid, priv)
@@ -4910,22 +3400,6 @@ def dashboard_top(g):
     return t
 
 
-def color_legend():
-    """The marker/colour key — shown at the BOTTOM of the overview, out of the way."""
-    t = Text()
-    t.append("legend  ", style="grey50")
-    t.append(f"{STAR} high-value", style="bold red")
-    t.append("  ", style="grey50")
-    t.append(f"priv user {PRIV_MARK}", style=PRIV_STYLE)
-    t.append("  ", style="grey50")
-    t.append("priv host", style=PRIV_COMP_STYLE)
-    t.append("  ", style="grey50")
-    t.append(KERB, style="yellow")
-    t.append("  ", style="grey50")
-    t.append(OWNED_TAG, style="green")
-    return t
-
-
 def _fastest_win(g, app):
     """(headline, dispatch_id) for the quickest route to domain admin — the out-of-band
     credential wins first (no ACL chain), else the start node's own path. The id lets
@@ -4988,15 +3462,6 @@ def route_tag(g, sid):
     return tech, best[0], best[1]
 
 
-def route_text(g, sid):
-    """'NAME: TECH ⇒ target (Nh)' — the compact one-line privesc used in the overview."""
-    rt = route_tag(g, sid)
-    if not rt:
-        return None
-    tech, tgt, hops = rt
-    return f"{short(g, sid)}: {tech} ⇒ {_tgt_short(tgt)} ({hops}h)"
-
-
 def _tgt_short(label):
     return "domain" if label == "Domain compromise" else label
 
@@ -5028,37 +3493,50 @@ def dashboard_position_rows(g, app):
     the owned set reaches each), and the single FASTEST WIN. Each is (id, Text, enabled)."""
     priv = app.priv
     rows = []
-    pad = "  "                                  # small indent for the sub-rows (kept left so
-    #                                             a "NAME: Right ×N" line fits without wrapping)
-    # OWNED — count + the footholds you hold, each with the strongest right IT wields (so an
+    # OWNED — a header, then one row per foothold with the strongest right IT wields (so an
     # owned foothold's privesc shows here even when it is not the current start node).
+    W = 42                                      # usable width of the overview column
+    priv = app.priv
+
+    def node_row(rid, icon, s, extra):
+        """'  <icon> NAME ◆ 🎟  <extra>' — the name styled like everywhere else (kind colour,
+        privileged / high-value / kerberoastable markers); `extra` drops to its own line
+        when the row would be too wide for the column."""
+        lab = Text(f"  {icon} ")
+        lab.append_text(ntext(g, s, priv=priv, kind=False))
+        if extra and cell_len(lab.plain) + 2 + cell_len(extra.plain) <= W:
+            lab.append("  ")
+            lab.append_text(extra)
+            extra = None
+        rows.append((rid, lab, True))
+        if extra:
+            rows.append((rid, Text("      ").append_text(extra), True))
+
     if app.owned:
-        names = sorted(short(g, s) for s in app.owned)
-        lab = Text(f"{'OWNED':<8}", style="bold grey62")
-        lab.append(f"{OWNED} {len(app.owned)}   ", style="bold green")
-        lab.append(", ".join(names[:4]) + ("  …" if len(names) > 4 else ""), style="green")
-        rows.append(("owned_view", lab, True))
+        rows.append(("owned_view", Text(f"OWNED ({len(app.owned)})", style="bold grey62"), True))
         for s in sorted(app.owned, key=lambda s: short(g, s).lower()):
             pw = start_power(g, s)
-            if pw:
-                right, cnt, _effect = pw
-                rows.append((s, Text(f"{pad}{short(g, s)}: {right} ×{cnt}", style="red"), True))
+            node_row(s, OWNED + (TARGET if s in app.targets else ""), s,
+                     Text(f"{pw[0]} ×{pw[1]}", style="red") if pw else None)
     else:
-        rows.append(("owned_view", Text(f"{'OWNED':<8}none — highlight a node and press Ctrl+O",
+        rows.append(("owned_view", Text("OWNED  none — highlight a node and press Ctrl+O",
                                         style="bold grey62"), False))
-    # TARGETS — one line per 🎯: reachable from the owned set (hops + foothold) or not
+    # TARGETS — a header, then one row per 🎯 with whether the owned set reaches it
     if app.targets:
         reach = app.owned_reach()
-        for i, s in enumerate(sorted(app.targets, key=lambda s: short(g, s).lower())):
-            lab = Text(f"{'TARGETS' if i == 0 else '':<8}", style="bold grey62")
-            lab.append(f"{TARGET} {short(g, s)}  ", style=TARGET_STYLE)
+        rows.append(("owned_view", Text(f"TARGETS ({len(app.targets)})", style="bold grey62"), True))
+        for s in sorted(app.targets, key=lambda s: short(g, s).lower()):
             if s in app.owned:
-                lab.append(f"{OWNED} owned", style=OWNED_STYLE)
-            elif s in reach:
-                lab.append(f"{CHECK} {reach[s][0]}h via {short(g, reach[s][1])}", style="bold green")
+                node_row(f"tgt_{s}", OWNED + TARGET, s, None)
+                continue
+            if s in reach:
+                extra = Text(f"{REACH_MARK} {reach[s][0]}h via {short(g, reach[s][1])}",
+                             style="bold green")
+            elif app.owned:
+                extra = Text("✗ no path", style="bold red")
             else:
-                lab.append("✗ no path", style="red")
-            rows.append((f"tgt_{s}", lab, True))
+                extra = Text("own something first", style="grey50")
+            node_row(f"tgt_{s}", TARGET, s, extra)
     rows.append(("_spacer", Text(""), False))         # one blank line under the OWNED block
     # FASTEST WIN — the single quickest route to domain admin
     win, target = _fastest_win(g, app)
@@ -5104,7 +3582,7 @@ def dashboard_rows(g):
     ]
 
 
-class Overview(VerticalScroll):
+class Overview(Vertical):
     """Left dashboard, all CLICKABLE: your POSITION (start + its shortest path), OWNED,
     the single FASTEST WIN, then the population list (Users / Computers / Groups / …).
     Domain facts sit at the top."""
@@ -5265,7 +3743,7 @@ class PrincipalTable(Vertical):
             return -1, Text(f"{OWNED} owned", style=OWNED_STYLE)
         r = self.app.owned_reach().get(s)
         if r:
-            return r[0], Text(f"{CHECK} {r[0]}h · {short(self.g, r[1])}", style="bold green")
+            return r[0], Text(f"{REACH_MARK} {r[0]}h · {short(self.g, r[1])}", style="bold green")
         if not self.app.owned:
             return 999, Text("- (own something: ^o)", style="grey42")
         return 999, Text("-", style="grey42")
@@ -5859,9 +4337,12 @@ class AttackTreeBase(Vertical):
         if nodes:
             nodes[-1].allow_expand = False             # the final target is the leaf
 
-    def _category(self, root, label, sids, style="bold", expand=False, tag_owned=False):
+    def _category(self, root, label, sids, style="bold", expand=False, tag_owned=False,
+                  via=None):
         """When `tag_owned`, each row gets the green ✓ owned/start tag if your owned set
-        reaches it (same flag as the rights search), so held entries stand out in place."""
+        reaches it (same flag as the rights search), so held entries stand out in place.
+        `via` = {sid: [edge labels]} appends how each row relates to the node (for the
+        Controlled-by list: the rights that principal holds) so it reads without drilling."""
         g = self.g
         sids = list(dict.fromkeys(sids))
         if not sids:
@@ -5870,6 +4351,12 @@ class AttackTreeBase(Vertical):
         cat = root.add(Text(f"{label}  ({len(sids)})", style=style), expand=expand)
         for s in sorted(sids, key=self._list_sort_key)[:INLINE_CAP]:
             line = self._line(s)
+            if via and via.get(s):
+                line.append("   via ", style="grey50")
+                for k, lbl in enumerate(via[s]):
+                    if k:
+                        line.append(", ", style="grey50")
+                    line.append(lbl, style="bold magenta" if lbl in bh._DANGER else "yellow")
             if reach is not None:
                 self._owned_tag(line, s, reach)
             child = cat.add(line, data={"sid": s, "anc": frozenset({s})})
@@ -5966,6 +4453,8 @@ class ExploreView(AttackTreeBase):
     memberships pruned), the credential routes to DA that need no ACL, drill in
     inline, detail along the bottom. Backspace walks back up; Ctrl+S sets a new start."""
 
+    BINDINGS = [Binding("x", "unpin", "Unpin path", show=False)]
+
     def __init__(self):
         super().__init__()
         self.current = None
@@ -5985,6 +4474,9 @@ class ExploreView(AttackTreeBase):
             main = Tree("", id="tree")
             main.show_root = True
             yield main
+            pinned = Tree("", id="pathtree")      # paths pinned from the path view
+            pinned.show_root = True
+            yield pinned
             other = Tree("", id="othertree")
             other.show_root = True
             yield other
@@ -6028,7 +4520,7 @@ class ExploreView(AttackTreeBase):
             self.app.set_detail(intro=Text(
                 "Mark the principals you control with Ctrl+O and they collect here as your "
                 "OWNED SET, each showing what it can take over. Mark objects you're going "
-                "after with Ctrl+T, then open Targets (press t) to check reachability.",
+                "after with Ctrl+T, then search (press /) to check reachability.",
                 style="grey62"))
 
     def _fill_other_tree(self):
@@ -6063,6 +4555,50 @@ class ExploreView(AttackTreeBase):
         other.root.expand()
 
     def _fill_target_tree(self):
+        self._fill_path_tree()
+        self._fill_targets_only()
+
+    def _fill_path_tree(self):
+        """Paths pinned from the path view (p), each its own nested chain. Hidden when none."""
+        g, app = self.g, self.app
+        tree = self.query_one("#pathtree", Tree)
+        tree.clear()
+        pins = [(a, b) for (a, b) in app.paths if g.nodes.get(a) and g.nodes.get(b)]
+        if not pins:
+            tree.display = False
+            return
+        tree.display = True
+        tree.root.data = None
+        tree.root.set_label(banner(f"{PIN} PINNED PATHS — x on a path unpins it", bg="dark_blue"))
+        for a, b in pins:
+            path = g.bfs_path(a, b)
+            hops = f"{len(path) - 1} hop{'s' if len(path) != 2 else ''}" if path else "no path"
+            lab = Text(f"{PIN} ", style="bold")
+            lab.append_text(ntext(g, a, priv=app.priv))
+            lab.append("  →  ", style="bold cyan")
+            lab.append_text(ntext(g, b, priv=app.priv))
+            lab.append(f"   ({hops})", style="grey62")
+            hdr = tree.root.add(lab, data={"pin": (a, b), "loaded": True}, expand=True)
+            if path and len(path) > 1:
+                self._add_path_hops(hdr, a, b, path=path)
+            else:
+                hdr.add_leaf(Text("✗ no control path any more", style="red")).allow_expand = False
+        tree.root.expand()
+
+    def action_unpin(self):
+        tree = self.query_one("#pathtree", Tree)
+        node = tree.cursor_node if tree.has_focus else None
+        while node is not None and not (node.data or {}).get("pin"):
+            node = node.parent
+        if node is None:
+            return
+        pin = node.data["pin"]
+        if pin in self.app.paths:
+            self.app.paths.remove(pin)
+            self.app.notify(f"unpinned {short(self.g, pin[0])} → {short(self.g, pin[1])}")
+        self._fill_path_tree()
+
+    def _fill_targets_only(self):
         """Fill the SEPARATE target tree with each marked target and its shortest path from
         the owned set (or, with no path, the nearest principals that CAN reach it). Its own
         tree — like OTHER ROUTES — so targets read as a distinct section. Hidden when there
@@ -6091,7 +4627,7 @@ class ExploreView(AttackTreeBase):
             else:
                 path = g.path_in(reach, s)
                 if path and len(path) > 1:
-                    child.add_leaf(Text(f"{CHECK} {len(path) - 1} step"
+                    child.add_leaf(Text(f"{REACH_MARK} {len(path) - 1} step"
                                         f"{'s' if len(path) != 2 else ''} from "
                                         f"{OWNED} {short(g, path[0][0])}",
                                         style="bold green")).allow_expand = False
@@ -6615,10 +5151,20 @@ class SummaryView(AttackTreeBase):
     def _ctx_label(self):
         return "summary"
 
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="summscroll"):
+            main = Tree("", id="tree")
+            main.show_root = True
+            yield main
+            dq = Tree("", id="dqtree")
+            dq.show_root = True
+            yield dq
+
     def on_mount(self):
         g = self.g
         tree = self.query_one("#tree", Tree)
-        tree.border_title = "domain summary — Space/Enter drop down · Enter drills · Esc back"
+        self.query_one("#summscroll").border_title = (
+            "domain summary — Space/Enter drop down · Enter drills · Esc back")
         root = tree.root
         kinds = defaultdict(int)
         for n in g.nodes.values():
@@ -6658,6 +5204,23 @@ class SummaryView(AttackTreeBase):
                if n.p("unconstraineddelegation") and not bh._is_default_unconstrained(g, s)]
 
         dcs = [s for s, n in g.nodes.items() if n.kind == "Computer" and bh._is_dc(g, s)]
+        dq = g.dq or {}
+        dqtree = self.query_one("#dqtree", Tree)
+        if dq.get("notes") or dq.get("collectors"):
+            col = ", ".join(dq.get("collectors", [])) or "unknown collector"
+            dqn = dqtree.root
+            dqn.set_label(Text(f"DATA QUALITY — {col}  ({len(dq.get('notes', []))} note(s))",
+                               style="bold yellow" if dq.get("notes") else "grey62"))
+            dqn.data = None
+            if dq.get("notes"):
+                dqn.expand()
+            for note in dq.get("notes", []):
+                dqn.add_leaf(Text("⚠ " + note, style="yellow")).allow_expand = False
+            if dq.get("laps_noreader"):
+                self._category(dqn, "LAPS computers with no visible reader",
+                               dq["laps_noreader"], style="yellow")
+        else:
+            dqtree.display = False
         self._category(root, "Domain / Enterprise Admins", da, style="bold red", expand=True)
         self._category(root, "Domain controllers", sorted(dcs), style="bold red", expand=True)
         self._category(root, "Kerberoastable users", kerb, style="bold red", expand=True)
@@ -6912,10 +5475,19 @@ class NodeInfoView(AttackTreeBase):
             if best:
                 facts.add_leaf(Text(f"reaches {STAR} {best[0]} in {best[1]} hop(s)",
                                     style="red")).allow_expand = False
-        reach = g.reachable(sid)
-        if len(reach) > 1:
-            facts.add_leaf(Text(f"controls {len(reach) - 1} node(s) downstream",
+        n_groups, n_rights, n_targets, n_reach = bh._control_counts(g, sid)
+        if n_groups:
+            facts.add_leaf(Text(f"member of {n_groups} group(s)",
                                 style="grey70")).allow_expand = False
+        if n_rights:
+            facts.add_leaf(Text(f"holds {n_rights} control right(s) over {n_targets} object(s)"
+                                " (direct + via groups)", style="grey70")).allow_expand = False
+        else:
+            facts.add_leaf(Text("holds no control rights (direct or via groups)",
+                                style="grey50")).allow_expand = False
+        if n_reach:
+            facts.add_leaf(Text(f"reach: {n_reach} node(s) by chaining memberships and rights",
+                                style="grey50")).allow_expand = False
         inbound = g.rctrl.get(sid, [])
         if inbound:
             facts.add_leaf(Text(f"controlled by {len(inbound)} principal(s)",
@@ -7026,7 +5598,12 @@ class NodeInfoView(AttackTreeBase):
                 gnode = cat.add(self._memgroup_line(sid, gs),
                                 data={"sid": gs, "anc": frozenset({sid, gs}), "memgroup": True})
                 gnode.allow_expand = True                 # always a drop-down
-        self._category(tree.root, "Controlled by", [s for (s, l) in g.rctrl.get(sid, [])])
+        via = {}
+        for (s, l) in g.rctrl.get(sid, []):
+            via.setdefault(s, [])
+            if l not in via[s]:
+                via[s].append(l)
+        self._category(tree.root, "Controlled by", list(via), via=via)
         tree.root.expand()                        # groups show collapsed with a ▶ drop-down
         self._detail(sid)
         tree.focus()
@@ -7132,6 +5709,411 @@ class TextScreen(Screen):
         self.app.pop_screen()
 
 
+class ConfirmScreen(ModalScreen):
+    """Yes / No dialog; dismisses with True or False."""
+    BINDINGS = [Binding("escape", "no", "No"), Binding("n", "no", "No"),
+                Binding("y", "yes", "Yes")]
+
+    def __init__(self, question):
+        super().__init__()
+        self.question = question
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirmbox"):
+            yield Static(self.question, id="confirmq")
+            with Horizontal(id="confirmbtns"):
+                yield Button("Yes (y)", id="yes", variant="error")
+                yield Button("No (n)", id="no", variant="primary")
+
+    def on_button_pressed(self, event):
+        self.dismiss(event.button.id == "yes")
+
+    def action_yes(self):
+        self.dismiss(True)
+
+    def action_no(self):
+        self.dismiss(False)
+
+
+class PathView(AttackTreeBase):
+    """Shortest control path between ANY two nodes, in the box: FROM / TO inputs with a
+    live match list on top, the path as a drillable tree below. ^p pins it to the attack tree."""
+    BINDINGS = [Binding("ctrl+r", "swap", "Swap FROM/TO"),
+                Binding("ctrl+p", "pin", "Pin to attack tree")]
+    MAX_HITS = 60
+
+    def __init__(self):
+        super().__init__()
+        self.sel = {"patha": None, "pathb": None}
+        self._active = "patha"
+        self._hits = []
+
+    @property
+    def priv(self):
+        return self.app.priv
+
+    def _ctx_label(self):
+        return "path"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pathpanel"):
+            with Horizontal(classes="pathrow"):
+                yield Static(Text("FROM", style="bold"), classes="pathlbl")
+                yield Input(placeholder="type a name…", id="patha")
+                yield Static(id="patha_sel", classes="pathsel")
+            with Horizontal(classes="pathrow"):
+                yield Static(Text("TO", style="bold"), classes="pathlbl")
+                yield Input(placeholder="type a name…", id="pathb")
+                yield Static(id="pathb_sel", classes="pathsel")
+            yield Static(id="pathhitshdr")
+            hits = OptionList(id="pathhits")
+            hits.can_focus = False
+            yield hits
+            yield Static(self._legend(), id="pathkeys")
+        tree = Tree("", id="tree")
+        tree.show_root = True
+        yield tree
+
+    @staticmethod
+    def _legend():
+        t = Text()
+        for key, what in (("↑↓", "move"), ("Enter", "pick"), ("Tab", "next box / tree"),
+                          ("^r", "swap"), ("^p", "pin to attack tree")):
+            t.append(f" {key} ", style="bold black on grey58")
+            t.append(f" {what}   ", style="grey70")
+        return t
+
+    def on_mount(self):
+        app, g = self.app, self.g
+        self.query_one("#pathpanel").border_title = "path between two nodes"
+        a, b = app.path_pick
+        if a not in g.nodes:
+            a = app.start or (next(iter(app.owned)) if len(app.owned) == 1 else None)
+        if a in g.nodes:
+            self._choose("patha", a, advance=False)
+        if b in g.nodes:
+            self._choose("pathb", b, advance=False)
+        focus = "pathb" if self.sel["patha"] and not self.sel["pathb"] else "patha"
+        self._active = focus
+        self.query_one(f"#{focus}", Input).focus()
+        self._refresh_hits()
+        self._render_sel()
+        self._search()
+
+    # ---- matching --------------------------------------------------------
+    def _quick_picks(self, which):
+        """Suggestions for an empty box: your footholds for FROM, targets / high-value for TO."""
+        app, g = self.app, self.g
+        if which == "patha":
+            sids = ([app.start] if app.start else []) + sorted(app.owned, key=lambda s: short(g, s))
+        else:
+            sids = sorted(app.targets, key=lambda s: short(g, s)) + sorted(
+                (s for s in g.nodes if g.is_highvalue(s) and g.nodes[s].kind in ("Group", "Domain")),
+                key=lambda s: short(g, s))
+        seen, out = set(), []
+        for s in sids:
+            if s in g.nodes and s not in seen:
+                seen.add(s); out.append(s)
+        return out[:self.MAX_HITS]
+
+    def _matches(self, token):
+        g = self.g
+        t = token.strip().upper()
+        if not t:
+            return None
+        if t in g.nodes:
+            return [t]
+        scored = []
+        for sid, n in g.nodes.items():
+            full = (n.name or "").upper()
+            base = full.split("@")[0]
+            if t in full or t in sid.upper():
+                rank = 0 if base == t else 1 if base.startswith(t) else 2 if t in base else 3
+                scored.append((rank, len(base), base, sid))
+        scored.sort()
+        return [x[3] for x in scored]
+
+    def _label(self, sid):
+        g, app = self.g, self.app
+        n = g.nodes[sid]
+        t = Text()
+        mark = (OWNED if sid in app.owned else TARGET if sid in app.targets else "  ")
+        t.append(mark + " ")
+        t.append(f"{short(g, sid):<34}", style="bold red" if g.is_highvalue(sid) else "white")
+        t.append(f" {n.kind:<13}", style="grey62")
+        dom = n.name.split("@", 1)[1] if "@" in (n.name or "") else ""
+        if dom:
+            t.append(dom.lower(), style="grey42")
+        return t
+
+    def _refresh_hits(self):
+        which = self._active
+        val = self.query_one(f"#{which}", Input).value
+        m = self._matches(val)
+        quick = m is None
+        hits = self._quick_picks(which) if quick else m
+        total = len(hits)
+        self._hits = hits[:self.MAX_HITS]
+        ol = self.query_one("#pathhits", OptionList)
+        ol.clear_options()
+        for s in self._hits:
+            ol.add_option(Option(self._label(s), id=s))
+        if self._hits:
+            ol.highlighted = 0
+        box = "FROM" if which == "patha" else "TO"
+        hdr = Text()
+        if quick:
+            hdr.append(f"{box}: ", style="bold cyan")
+            hdr.append(("your start / owned nodes" if which == "patha"
+                        else "targets + high-value groups") if self._hits
+                       else "start typing to search every node", style="grey62")
+        else:
+            hdr.append(f"{box}: ", style="bold cyan")
+            hdr.append(f"{total} match{'es' if total != 1 else ''}"
+                       + (f" (first {self.MAX_HITS})" if total > self.MAX_HITS else ""),
+                       style="grey62" if total else "red")
+        self.query_one("#pathhitshdr", Static).update(hdr)
+
+    # ---- selection ---------------------------------------------------------
+    def _render_sel(self):
+        for which in ("patha", "pathb"):
+            sid = self.sel[which]
+            st = self.query_one(f"#{which}_sel", Static)
+            if sid:
+                st.update(Text(f"{CHECK} {self.g.nodes[sid].kind}", style="bold green"))
+            else:
+                st.update(Text("—", style="grey42"))
+
+    def _choose(self, which, sid, advance=True):
+        self.sel[which] = sid
+        self.app.path_pick = [self.sel["patha"], self.sel["pathb"]]
+        inp = self.query_one(f"#{which}", Input)
+        inp.value = short(self.g, sid)
+        inp.cursor_position = len(inp.value)
+        self._render_sel()
+        other = "pathb" if which == "patha" else "patha"
+        if advance and not self.sel[other]:
+            self.query_one(f"#{other}", Input).focus()
+        self._search()
+
+    def on_descendant_focus(self, event):
+        w = event.widget
+        if isinstance(w, Input) and w.id in self.sel and w.id != self._active:
+            self._active = w.id
+            self._refresh_hits()
+
+    def on_input_changed(self, event):
+        which = event.input.id
+        if which not in self.sel:
+            return
+        sid = self.sel[which]
+        if sid and event.value != short(self.g, sid):
+            self.sel[which] = None
+            self.app.path_pick = [self.sel["patha"], self.sel["pathb"]]
+            self._render_sel()
+            self._search()
+        self._active = which
+        self._refresh_hits()
+
+    def on_key(self, event):
+        if event.key in ("up", "down") and isinstance(self.app.focused, Input):
+            ol = self.query_one("#pathhits", OptionList)
+            if ol.option_count:
+                (ol.action_cursor_down if event.key == "down" else ol.action_cursor_up)()
+            event.stop(); event.prevent_default()
+
+    def on_input_submitted(self, event):
+        which = event.input.id
+        ol = self.query_one("#pathhits", OptionList)
+        if ol.highlighted is not None and self._hits:
+            self._choose(which, self._hits[ol.highlighted])
+        else:
+            self._search()
+
+    def on_option_list_option_selected(self, event):
+        if event.option.id in self.g.nodes:
+            self._choose(self._active, event.option.id)
+            self.query_one(f"#{self._active}", Input).focus()
+
+    def action_swap(self):
+        a, b = self.sel["patha"], self.sel["pathb"]
+        va = self.query_one("#patha", Input).value
+        vb = self.query_one("#pathb", Input).value
+        self.sel = {"patha": b, "pathb": a}
+        self.app.path_pick = [b, a]
+        self.query_one("#patha", Input).value = vb
+        self.query_one("#pathb", Input).value = va
+        self._render_sel()
+        self._search()
+
+    # ---- result ----------------------------------------------------------------
+    def _shown(self):
+        """(src, dst) of the path currently drawn — the reverse pair if only that exists."""
+        src, dst = self.sel["patha"], self.sel["pathb"]
+        if not src or not dst or src == dst:
+            return None
+        if self.g.bfs_path(src, dst):
+            return (src, dst)
+        if self.g.bfs_path(dst, src):
+            return (dst, src)
+        return None
+
+    def _pin_label(self, pair):
+        pinned = pair in self.app.paths
+        return Text(f"{PIN} " + ("pinned to the attack tree — ^p / Enter unpins" if pinned
+                                 else "add this path to the attack tree — ^p / Enter"),
+                    style="bold green" if pinned else "bold cyan")
+
+    def _search(self):
+        g = self.g
+        src, dst = self.sel["patha"], self.sel["pathb"]
+        tree = self.query_one("#tree", Tree)
+        tree.clear()
+        root = tree.root
+        root.data = None
+        if not src or not dst:
+            root.set_label(Text("pick a node in both boxes", style="grey50"))
+            return
+        if src == dst:
+            root.set_label(Text("same node — pick two different ones", style="yellow"))
+            return
+        pair = self._shown()
+        if pair is None:
+            self._no_path(root, src, dst)
+            return
+        a, b = pair
+        path = g.bfs_path(a, b)
+        lab = Text()
+        if pair != (src, dst):
+            lab.append("reverse only (^r swaps):  ", style="yellow")
+        lab.append_text(ntext(g, a, priv=self.priv))
+        lab.append("  →  ", style="bold cyan")
+        lab.append_text(ntext(g, b, priv=self.priv))
+        lab.append(f"   ({len(path) - 1} hop{'s' if len(path) != 2 else ''})", style="grey62")
+        root.set_label(lab)
+        root.data = {"sid": a, "anc": frozenset({a}), "loaded": True}
+        pin = root.add_leaf(self._pin_label(pair), data={"action": "pin"})
+        pin.allow_expand = False
+        self._add_path_hops(root, a, b, path=path)
+        root.expand()
+
+    def _no_path(self, root, src, dst):
+        g = self.g
+        lab = Text(" ✗ NO PATH ", style="bold white on dark_red")
+        lab.append("  ")
+        lab.append_text(ntext(g, src, priv=self.priv))
+        lab.append("  ✗  ", style="bold red")
+        lab.append_text(ntext(g, dst, priv=self.priv))
+        root.set_label(lab)
+        root.data = None
+        root.add_leaf(Text(f"{short(g, src)} has no control edge chain to {short(g, dst)} — "
+                           "and none runs the other way either.",
+                           style="red")).allow_expand = False
+        back = g.reached_by(dst)
+        near = sorted((x for x in back if x not in (src, dst) and g.nodes.get(x)),
+                      key=lambda x: (back[x], short(g, x).lower()))
+        if near:
+            hdr = root.add(Text(f"who CAN reach {short(g, dst)} ({len(near)}) — get one of these "
+                                "first, then path from it", style="bold yellow"), expand=True)
+            for x in near[:INLINE_CAP]:
+                line = self._line(x)
+                line.append(f"   {back[x]}h", style="grey50")
+                hdr.add(line, data={"sid": x, "anc": frozenset({x})}).allow_expand = False
+            if len(near) > INLINE_CAP:
+                hdr.add(Text(f"... +{len(near) - INLINE_CAP} more (open list)", style="grey50"),
+                        data={"list": (f"Who can reach {short(g, dst)}", near)}).allow_expand = False
+        else:
+            root.add_leaf(Text(f"nothing in this data has a control path to {short(g, dst)}.",
+                               style="grey62")).allow_expand = False
+        root.expand()
+
+    def action_pin(self):
+        pair = self._shown()
+        if pair is None:
+            self.app.notify("pick two nodes with a path between them first", severity="warning")
+            return
+        g = self.g
+        if pair in self.app.paths:
+            self.app.paths.remove(pair)
+            self.app.notify(f"unpinned {short(g, pair[0])} → {short(g, pair[1])}")
+        else:
+            self.app.paths.append(pair)
+            self.app.notify(f"pinned {short(g, pair[0])} → {short(g, pair[1])} "
+                            "to the attack tree (a)")
+        for node in self.query_one("#tree", Tree).root.children:
+            if (node.data or {}).get("action") == "pin":
+                node.set_label(self._pin_label(pair))
+
+    def on_tree_node_selected(self, event: Tree.NodeSelected):
+        if (event.node.data or {}).get("action") == "pin":
+            self.action_pin()
+            return
+        super().on_tree_node_selected(event)
+
+
+class HelpScreen(Screen):
+    """Key reference for every view. `?` opens it from anywhere; Esc or `?` closes it."""
+    BINDINGS = [Binding("escape", "back", "Close"),
+                Binding("question_mark", "back", "Close")]
+    SECTIONS = [
+        ("Everywhere", [
+            ("?", "this help"),
+            ("Esc / Backspace", "back one step (Esc at the start view quits)"),
+            ("i", "node info for the selected row"),
+            ("^o", "mark / unmark the selected node as owned"),
+            ("^t", "mark / unmark the selected node as a target"),
+            ("^c / ^q", "quit")]),
+        ("Symbols", [
+            (OWNED, "owned — a principal you control (^o)"),
+            (TARGET, "target — something you're going after (^t)"),
+            (OWNED + TARGET, "a target you already own"),
+            (PIN, "a path pinned to the attack tree (p, then ^p)"),
+            (STAR, "high-value / privileged (red name = Tier-0)"),
+            (KERB_MARK, "kerberoastable — has an SPN, crack the ticket for creds (purple name)"),
+            (REACH_MARK, "your owned set has a control path to it (hops · via which foothold)"),
+            (CHECK, "a right you already hold / a picked node"),
+            ("✗", "no control path"),
+            ("⚠", "data-quality note (see Domain summary)")]),
+        ("Jump to a view", [
+            ("/ or t", "search all nodes (REACH column = path from owned)"),
+            ("u", "users"), ("c", "computers"), ("g", "groups"), ("a", "attack tree"),
+            ("p", "path between two nodes")]),
+        ("Trees (attack tree, routes, node info)", [
+            ("Enter / Space", "expand a row, or open a node that has no children"),
+            ("arrows", "move"),
+            ("y", "copy the selected line or section to the clipboard")]),
+        ("Lists (users, computers, groups, ...)", [
+            ("type", "filter the list"),
+            ("click a column header", "sort by it; the search box then matches that column"),
+            ("Enter", "open the selected node"),
+            ("^e", "show enabled accounts only"),
+            ("^x", "export the current list")]),
+        ("Export", [("^s", "write the file"), ("Esc", "cancel")]),
+        ("Loading", [
+            ("-d DATA", "a .zip / dir / .json collection"),
+            ("-d a -d b", "repeat -d to merge per-box collections into one graph")]),
+        ("Saved state", [
+            ("auto", "owned / targets / start / pinned paths are saved per domain"),
+            ("menu", "Reset saved state clears them (asks first)"),
+            ("--fresh", "launch flag: start clean and delete the saved state")]),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+        t = Text()
+        for title, keys in self.SECTIONS:
+            t.append(f"{title}\n", style="bold")
+            for key, what in keys:
+                t.append(f"  {key}" + " " * max(1, 24 - cell_len(key)), style="bold cyan")
+                t.append(f"{what}\n", style="grey70")
+            t.append("\n")
+        yield VerticalScroll(Static(t, id="helpbody"))
+        yield Footer()
+
+    def action_back(self):
+        self.app.pop_screen()
+
+
 # --------------------------------------------------------------------------- #
 # the hub
 # --------------------------------------------------------------------------- #
@@ -7146,11 +6128,13 @@ class HomeScreen(Screen):
         Binding("i", "info", "Node info"),
         Binding("ctrl+o", "owned", "Mark owned"),
         Binding("ctrl+t", "target", "Mark target"),
-        Binding("t", "goto('targets')", "Targets"),
+        Binding("t", "goto('search')", "Search", show=False),
         Binding("u", "goto('users')", "Users"),
         Binding("c", "goto('computers')", "Computers"),
         Binding("g", "goto('groups')", "Groups"),
         Binding("a", "goto('tree')", "Attack tree"),
+        Binding("slash", "goto('search')", "Search"),
+        Binding("p", "goto('path')", "Path A→B"),
         Binding("ctrl+c", "quit", "Quit", priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
@@ -7173,7 +6157,8 @@ class HomeScreen(Screen):
 
     # (id, label).  COUNTABLE items grey out + read "none" at 0 instances.
     MENU = [
-        ("targets", "Targets (can I reach it?)"),
+        ("search", "Search all nodes"),
+        ("path", "Path between two nodes"),
         ("users", "Users"),
         ("computers", "Computers"),
         ("groups", "Groups"),
@@ -7191,6 +6176,7 @@ class HomeScreen(Screen):
         ("maq", "MAQ & owned machines"),
         ("pwpol", "Domain password policy"),
         ("summary", "Domain summary"),
+        ("reset", "Reset saved state"),
     ]
     COUNTABLE = {"das", "kerb", "asrep", "dcsync", "dcs", "adminto", "deleg", "adcs", "maq"}
 
@@ -7297,6 +6283,15 @@ class HomeScreen(Screen):
 
     def on_screen_resume(self):
         self._refresh()
+
+    def reset_view(self):
+        self.box_stack.clear()
+        self._current_restore = self.show_view
+        self.show_view()
+        self._view.current = None
+        self._view.show_empty()
+        self._refresh()
+        self.set_detail(None)
 
     def _refresh(self):
         try:
@@ -7459,11 +6454,10 @@ class HomeScreen(Screen):
             # overview rows → show the attack-tree view (OWNED SET and the routes below)
             self._view.show_empty()
             self.show_view()
-        elif mid == "targets":
-            sids = [s for s, n in g.nodes.items() if n.kind in TARGET_KINDS]
+        elif mid in ("search", "targets"):
             self._go(lambda: self._mount_aux(PrincipalTable(
-                g, sids, "Targets — can my owned set reach it?", self.app.prof,
-                show_kind=True, reach=True)))
+                g, list(g.nodes), "All nodes — type to search · REACH = path from owned",
+                self.app.prof, show_kind=True, reach=True)))
         elif mid == "groups":
             sids = [s for s, n in g.nodes.items() if n.kind == "Group"]
             self._go(lambda: self._build_list("Groups — read into a member", sids))
@@ -7519,6 +6513,13 @@ class HomeScreen(Screen):
             self._go(lambda: self._build_text("Domain password policy", bh.cmd_pwpolicy, g, A()))
         elif mid == "summary":
             self._go(self._build_summary)
+        elif mid == "reset":
+            self.app.push_screen(ConfirmScreen(
+                "Forget owned, targets and start node for this domain?\n"
+                + bh.state_path(g)),
+                lambda ok: ok and self.app.reset_state())
+        elif mid == "path":
+            self._go(lambda: self._mount_aux(PathView()))
 
 
 # --------------------------------------------------------------------------- #
@@ -7534,7 +6535,7 @@ class BerneseApp(App):
     #dashbox { height: 1fr; border: round $secondary; padding: 0 1; }
     #dashtop { height: auto; }
     #dashhint { height: auto; color: $text-muted; text-style: bold; margin-top: 1; }
-    #jump { height: auto; background: transparent; border: none; }
+    #jump { height: 1fr; background: transparent; border: none; }
     #sidedetailbox { height: 13; border: round $secondary; padding: 0 1; }
     #sidedetail { height: auto; }
     #box { width: 1fr; height: 1fr; }
@@ -7543,11 +6544,31 @@ class BerneseApp(App):
     /* stacked section trees (attack tree + other-routes, escalation sections): the scroll
        box carries the border; each inner tree is borderless, auto-height, with a gap below
        so the separate trees read as distinct, disconnected sections. */
-    #treescroll, #escscroll { height: 1fr; border: round $primary; padding: 0 1; }
-    #treescroll Tree, #escscroll Tree {
+    #treescroll, #escscroll, #summscroll { height: 1fr; border: round $primary; padding: 0 1; }
+    #treescroll Tree, #escscroll Tree, #summscroll Tree {
         height: auto; border: none; background: transparent; margin: 0 0 1 0;
     }
     #niview { height: 1fr; }
+    #helpbody { padding: 1 2; }
+    ConfirmScreen { align: center middle; }
+    #confirmbox { width: 70; height: auto; border: thick $error; background: $panel; padding: 1 2; }
+    #confirmq { margin-bottom: 1; }
+    #confirmbtns { height: auto; align: center middle; }
+    #confirmbtns Button { margin: 0 2; }
+    PathView { height: 1fr; }
+    #pathpanel { height: auto; border: round $primary; padding: 0 1; }
+    .pathrow { height: 1; margin-bottom: 1; }
+    .pathlbl { width: 6; }
+    #patha, #pathb { width: 1fr; height: 1; border: none; padding: 0 1;
+                     background: #3a4656; color: #ffffff; }
+    #patha:focus, #pathb:focus { background: #1d5f99; color: #ffffff; text-style: bold; }
+    #patha > .input--placeholder, #pathb > .input--placeholder { color: #b8c2cc; }
+    .pathlbl { color: #ffffff; text-style: bold; }
+    .pathsel { width: 16; padding: 0 1; }
+    #pathhitshdr { height: 1; }
+    #pathhits { height: auto; max-height: 7; border: none; background: transparent; }
+    #pathkeys { height: auto; }
+    PathView #tree { height: 1fr; }
     #exportlist { height: auto; max-height: 70%; border: round $primary; margin: 1 2; }
     #exportbtn { margin: 0 2 1 2; width: auto; }
     #maqtree { height: 1fr; border: round $primary; }
@@ -7566,10 +6587,17 @@ class BerneseApp(App):
     }
     """
     TITLE = "bernese"
+    BINDINGS = [Binding("question_mark", "help", "Help")]
 
-    def __init__(self, g):
+    def action_help(self):
+        if not isinstance(self.screen, HelpScreen):
+            self.push_screen(HelpScreen())
+
+    def __init__(self, g, restore=True):
         super().__init__()
         bh.C.enabled = False      # TUI renders colour via rich, not ANSI
+        self._restore = restore
+        self._saved = None                  # last snapshot written to the state file
         self.g = g
         self.priv = bh._priv_set(g)
         self.prof = {}                      # sid -> (_user_profile) cache, shared across screens
@@ -7577,6 +6605,8 @@ class BerneseApp(App):
         self.owned = set()                  # sids the operator has marked as owned
         self.start = None                   # current start node (its tree is shown on Home)
         self.targets = set()                # sids marked as targets (^t)
+        self.paths = []                     # (src, dst) paths pinned to the attack tree
+        self.path_pick = [None, None]       # last FROM / TO picked in the path view
         self._reach = (None, {})            # (frozenset(owned), reach_from result) cache
         self.sub_title = (g.domain_name or "?")
 
@@ -7589,7 +6619,51 @@ class BerneseApp(App):
         return self._reach[1]
 
     def on_mount(self):
+        restored = bh.load_state(self.g) if self._restore else None
+        if restored:
+            self.owned = set(restored["owned"])
+            self.targets = set(restored["targets"])
+            self.start = restored["start"]
+            self.paths = list(restored.get("paths", []))
+        self._saved = self._snapshot()
         self.push_screen(HomeScreen(self.g))
+        if restored and (self.owned or self.targets or self.start or self.paths):
+            bits = [f"{len(self.owned)} owned", f"{len(self.targets)} target(s)"]
+            if self.start:
+                bits.append("start " + short(self.g, self.start))
+            if self.paths:
+                bits.append(f"{len(self.paths)} pinned path(s)")
+            self.notify("restored saved state: " + ", ".join(bits)
+                        + " — menu › Reset saved state to clear", timeout=6)
+        self.set_interval(1.0, self._autosave)
+
+    def on_unmount(self):
+        self._autosave()                    # don't lose a change made inside the last tick
+
+    def _snapshot(self):
+        return (frozenset(self.owned), frozenset(self.targets), self.start, tuple(self.paths))
+
+    def _autosave(self):
+        snap = self._snapshot()
+        if snap != self._saved:
+            self._saved = snap
+            bh.save_state(self.g, self.owned, self.targets, self.start, self.paths)
+
+    def reset_state(self):
+        """Forget owned / targets / start for this domain, on disk and in the session."""
+        bh.clear_state(self.g)
+        self.owned.clear()
+        self.targets.clear()
+        self.start = None
+        self.paths = []
+        self.path_pick = [None, None]
+        self._saved = self._snapshot()
+        while len(self.screen_stack) > 2:
+            self.pop_screen()
+        h = self._home()
+        if h:
+            h.reset_view()
+        self.notify("saved state cleared")
 
     def _home(self):
         return next((s for s in reversed(self.screen_stack) if isinstance(s, HomeScreen)), None)
